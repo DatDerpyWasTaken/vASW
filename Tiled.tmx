@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<map version="1.10" tiledversion="1.11.2" orientation="orthogonal" renderorder="left-up" width="1" height="1" tilewidth="8000" tileheight="4000" infinite="0" nextlayerid="3" nextobjectid="1">
+ <tileset firstgid="1" name="Tileset" tilewidth="8000" tileheight="4000" tilecount="4" columns="2">
+  <image source="Tileset.png" width="16000" height="8000"/>
+ </tileset>
+ <layer id="1" name="world" width="1" height="1">
+  <data encoding="csv">
+2
+</data>
+ </layer>
+ <objectgroup id="2" name="sprites"/>
+</map>

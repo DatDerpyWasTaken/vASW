@@ -1,0 +1,174 @@
+{
+  "button": {
+    "colours": {
+      "normal_bg": "#0a0a14",
+      "hovered_bg": "#141428",
+      "active_bg": "#141428",
+      "disabled_bg": "#141428",
+      "normal_text": "#ECEFF4",
+      "hovered_text": "#FFFFFF",
+      "active_text": "#88C0D0",
+      "normal_border": "#0a0a14",
+      "hovered_border": "#141428",
+      "active_border": "#141428",
+      "disabled_border": "#141428"
+    },
+    "font": {
+      "name": "Roboto Mono",
+      "size": 14
+    },
+    "misc": {
+      "shape": "rectangle",
+      "shape_corner_radius": "0",
+      "border_width": "0",
+      "shadow_width": "0"
+    }
+  },
+
+  "text_entry_line": {
+    "colours": {
+      "dark_bg": "#0a0a14",
+      "normal_text": "#ECEFF4",
+      "selected_text": "#FFFFFF",
+      "selected_bg": "#141428",
+      "normal_border": "#141428",
+      "active_border": "#88C0D0"
+    },
+    "font": {
+      "name": "Roboto Mono",
+      "size": 10
+    },
+    "misc": {
+      "border_width": "1",
+      "shadow_width": "0"
+    }
+  },
+
+  "text_entry_line.#valid_input": {
+    "colours": {
+      "normal_border": "#99C979",
+      "active_border": "#99C979"
+    }
+  },
+  "text_entry_line.#invalid_input": {
+    "colours": {
+      "normal_border": "#b13b3b",
+      "active_border": "#b13b3b"
+    }
+  },
+
+  "drop_down_menu": {
+    "colours": {
+      "dark_bg": "#0a0a14",
+      "normal_text": "#ECEFF4",
+      "selected_text": "#FFFFFF",
+      "normal_border": "#141428",
+      "active_border": "#88C0D0"
+    },
+    "font": {
+      "name": "Roboto Mono",
+      "size": 14
+    },
+    "misc": {
+      "border_width": "1",
+      "shadow_width": "0",
+      "expand_direction": "up"
+    }
+  },
+
+  "drop_down_menu.#valid_input": {
+    "colours": {
+      "normal_border": "#99C979",
+      "active_border": "#99C979"
+    }
+  },
+
+  "drop_down_menu.#invalid_input": {
+    "colours": {
+      "normal_border": "#b13b3b",
+      "active_border": "#b13b3b"
+    }
+  },
+
+  "drop_down_menu.#drop_down_options_list": {
+    "colours": {
+      "dark_bg": "#0a0a14",
+      "normal_text": "#ECEFF4",
+      "selected_text": "#FFFFFF",
+      "selected_bg": "#141428"
+    },
+    "misc": {
+      "border_width": "1",
+      "shadow_width": "0",
+      "expand_direction": "up"
+    }
+  },
+
+  "label": {
+    "colours": {
+      "normal_text": "#D8DEE9"
+    },
+    "font": {
+      "name": "Roboto Mono",
+      "size": 14
+    }
+  },
+
+  "label.#valid_input": {
+    "colours": {
+      "normal_text": "#99C979"
+    }
+  },
+
+  "label.#invalid_input": {
+    "colours": {
+      "normal_text": "#b13b3b"
+    }
+  },
+
+  "panel": {
+    "colours": {
+      "dark_bg": "#05050a"
+    },
+    "misc": {
+      "border_width": "1",
+      "shadow_width": "0"
+    }
+  },
+  "text_box": {
+    "colours": {
+      "dark_bg": "#05050A",
+      "normal_text": "#ECEFF4",
+      "link_text": "#88C0D0",
+      "link_hover": "#FFFFFF"
+    },
+    "font": {
+      "name": "Roboto Mono",
+      "size": 1
+    },
+    "misc": {
+      "border_width": "0",
+      "shadow_width": "0"
+    }
+  },
+
+  "scrolling_container": {
+    "colours": {
+      "dark_bg": "#05050a",
+      "scroll_bar_colour": "#141428",
+      "scroll_button_colour": "#0a0a14",
+      "scroll_bar_hover_colour": "#141428",
+      "scroll_button_hover_colour": "#141428"
+    },
+    "font": {
+      "name": "Roboto Mono",
+      "size": 14
+    },
+    "misc": {
+      "border_width": "1",
+      "shadow_width": "0",
+      "scroll_bar_width": "10",
+      "scroll_speed": "5"
+    }
+  }
+}

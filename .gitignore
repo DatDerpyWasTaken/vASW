@@ -1,0 +1,14 @@
+build/
+dist/
+output/
+_internal/
+__pycache__/
+*.pyc
+*.zip
+*.spec
+crash.log
+xplane_ships.json
+Boats/
+gaist-ultra-V7_1/
+.env/
+venv/

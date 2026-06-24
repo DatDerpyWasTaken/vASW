@@ -1,0 +1,50 @@
+name: Build vASW Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller pygame-ce pygame_gui numpy scipy matplotlib pyaudio pyscroll pytmx PyOpenGL PyOpenGL_accelerate
+
+      - name: Build
+        shell: cmd
+        run: build.bat
+
+      - name: Package release zip
+        shell: powershell
+        run: |
+          Compress-Archive -Path .\dist\vASW\* -DestinationPath .\vASW-windows.zip -Force
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vASW-windows
+          path: vASW-windows.zip
+
+      - name: Attach to GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: vASW-windows.zip
+          generate_release_notes: true

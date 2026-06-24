@@ -1,0 +1,71 @@
+{
+  "default": "AI_Annabella",
+  "Surface-Ship": {
+    "Destroyer": "MiltechType45Destroyer",
+    "Frigate": "MiltechType23Frigate",
+    "Carrier": "Miltech HMASAdelaide",
+    "Civilian": "Miltech TankerShip",
+    "Unknown": "AI_Annabella",
+    "Cruise": "Miltech CruiseShip",
+    "Fishing": "mmh_fishingBoat_sinking",
+    "Hospital": "Miltech HospitalShip",
+    "Cutter": "Miltech USCGCutter",
+    "Tanker": "Miltech TankerShip",
+    "Sinking Container Ship": "MMH_SinkingCargoShip",
+    "Sinking Sail Ship": "mmh_sailBoat_sinking",
+    "Triton": "Miltech HDMSTriton",
+    "Adelaide": "Miltech HMASAdelaide",
+    "Juan Carlos": "Miltech JuanCarlosCarrier",
+    "Arleigh Burke": "mmh_arleighburke",
+    "Independence": "mmh_independence",
+    "Ticonderoga": "mmh_ticonderoga"
+  },
+  "Sub-surface": {
+    "Kilo": "Miltech RussianSub",
+    "Akula": "Miltech RussianSub",
+    "Delta": "Miltech RussianSub",
+    "Delta IV": "Miltech RussianSub",
+    "Borei": "Miltech RussianSub",
+    "Yasen": "Miltech RussianSub",
+    "Emitter": "Miltech SubmergedSub",
+    "Unknown": "Miltech SubmergedSub",
+    "American": "Miltech AmericanSub",
+    "Illegal": "Miltech IllegalSub",
+    "Russian": "Miltech RussianSub",
+    "Submerged": "Miltech SubmergedSub"
+  },
+  "miltech_missionhub_models": {
+    "AmericanSub": "Miltech AmericanSub",
+    "Cruise": "Miltech CruiseShip",
+    "FishingBoat": "mmh_fishingBoat_sinking",
+    "HDMSTriton": "Miltech HDMSTriton",
+    "HMASAdelaideCarrier": "Miltech HMASAdelaide",
+    "HospitalShip": "Miltech HospitalShip",
+    "IllegalSub": "Miltech IllegalSub",
+    "JuanCarlosCarrier": "Miltech JuanCarlosCarrier",
+    "mmhArleighBurke": "mmh_arleighburke",
+    "mmhIndependence": "mmh_independence",
+    "mmhTiconderoga": "mmh_ticonderoga",
+    "RussianSub": "Miltech RussianSub",
+    "sinkingContainerShip": "MMH_SinkingCargoShip",
+    "sinkingSailShip": "mmh_sailBoat_sinking",
+    "submergedSubmarine": "Miltech SubmergedSub",
+    "TankerShip": "Miltech TankerShip",
+    "Type23Frigate": "MiltechType23Frigate",
+    "Type45Destroyer": "MiltechType45Destroyer",
+    "USCGCutter": "Miltech USCGCutter"
+  },
+  "civilian_models": [
+    "Miltech CruiseShip",
+    "mmh_fishingBoat_sinking",
+    "Miltech HospitalShip",
+    "Miltech TankerShip",
+    "MMH_SinkingCargoShip",
+    "mmh_sailBoat_sinking",
+    "AI_Annabella"
+  ],
+  "splash": {
+    "model": "",
+    "duration": 2.5
+  }
+}

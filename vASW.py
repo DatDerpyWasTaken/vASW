@@ -106,7 +106,7 @@ DIFAR_DETECTION_UPDATE_INTERVAL_SEC = 0.20
 DIFAR_HIDDEN_DETECTION_UPDATE_INTERVAL_SEC = 1.50
 DIFAR_DETECTION_UPDATE_JITTER_SEC = 0.45
 SOUND_SPEED_MPS = 1500.0
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.3.0"
 GITHUB_OWNER = "DatDerpyWasTaken"
 GITHUB_REPO = "vASW"
 GITHUB_RELEASE_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
@@ -1822,9 +1822,14 @@ settings_aircraft_dropdown = pygame_gui.elements.UIDropDownMenu(
     relative_rect=scale_rect(pygame.Rect((1640, 242), (120, 28)), screen),
     manager=manager
 )
-settings_status_label = pygame_gui.elements.UILabel(
-    relative_rect=scale_rect(pygame.Rect((1770, 204), (126, 64)), screen),
+settings_version_label = pygame_gui.elements.UILabel(
+    relative_rect=scale_rect(pygame.Rect((1770, 204), (126, 28)), screen),
     text=f"v{APP_VERSION}",
+    manager=manager
+)
+settings_status_label = pygame_gui.elements.UILabel(
+    relative_rect=scale_rect(pygame.Rect((1770, 242), (126, 28)), screen),
+    text=f"{MULTIPLAYER_CALLSIGN} {MULTIPLAYER_AIRCRAFT_TYPE}",
     manager=manager
 )
 settings_update_button = pygame_gui.elements.UIButton(
@@ -1852,6 +1857,7 @@ settings_elements = [
     settings_callsign_entry,
     settings_aircraft_label,
     settings_aircraft_dropdown,
+    settings_version_label,
     settings_status_label,
     settings_update_button,
     settings_update_status_label
@@ -1871,9 +1877,61 @@ register_ui_element(settings_callsign_label, pygame.Rect((1524, 206), (110, 24))
 register_ui_element(settings_callsign_entry, pygame.Rect((1640, 204), (120, 28)))
 register_ui_element(settings_aircraft_label, pygame.Rect((1524, 244), (110, 24)))
 register_ui_element(settings_aircraft_dropdown, pygame.Rect((1640, 242), (120, 28)))
-register_ui_element(settings_status_label, pygame.Rect((1770, 204), (126, 64)))
+register_ui_element(settings_version_label, pygame.Rect((1770, 204), (126, 28)))
+register_ui_element(settings_status_label, pygame.Rect((1770, 242), (126, 28)))
 register_ui_element(settings_update_button, pygame.Rect((1524, 282), (116, 28)))
 register_ui_element(settings_update_status_label, pygame.Rect((1650, 282), (246, 28)))
+
+update_popup_visible = False
+update_popup_release = None
+update_check_started = False
+update_check_completed = False
+update_check_result = None
+update_check_error = None
+update_check_popup_shown = False
+update_check_start_time = time.time() + 2.5
+update_check_lock = Lock()
+
+update_popup_panel = pygame_gui.elements.UIPanel(
+    relative_rect=scale_rect(pygame.Rect((660, 390), (600, 250)), screen),
+    manager=manager
+)
+update_popup_title = pygame_gui.elements.UILabel(
+    relative_rect=scale_rect(pygame.Rect((690, 414), (540, 34)), screen),
+    text="UPDATE AVAILABLE",
+    manager=manager
+)
+update_popup_message = pygame_gui.elements.UILabel(
+    relative_rect=scale_rect(pygame.Rect((700, 470), (520, 72)), screen),
+    text="A newer vASW version is available.",
+    manager=manager
+)
+update_popup_update_button = pygame_gui.elements.UIButton(
+    relative_rect=scale_rect(pygame.Rect((790, 568), (150, 34)), screen),
+    text="UPDATE",
+    manager=manager
+)
+update_popup_later_button = pygame_gui.elements.UIButton(
+    relative_rect=scale_rect(pygame.Rect((980, 568), (150, 34)), screen),
+    text="LATER",
+    manager=manager
+)
+update_popup_elements = [
+    update_popup_panel,
+    update_popup_title,
+    update_popup_message,
+    update_popup_update_button,
+    update_popup_later_button
+]
+
+register_ui_element(update_popup_panel, pygame.Rect((660, 390), (600, 250)))
+register_ui_element(update_popup_title, pygame.Rect((690, 414), (540, 34)))
+register_ui_element(update_popup_message, pygame.Rect((700, 470), (520, 72)))
+register_ui_element(update_popup_update_button, pygame.Rect((790, 568), (150, 34)))
+register_ui_element(update_popup_later_button, pygame.Rect((980, 568), (150, 34)))
+
+for element in update_popup_elements:
+    element.hide()
 
 
 def parse_version_tag(tag):
@@ -1893,6 +1951,63 @@ def latest_release_metadata():
     )
     with urllib.request.urlopen(request, timeout=20) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def set_update_popup_visible(visible, release=None):
+    global update_popup_visible, update_popup_release
+    update_popup_visible = bool(visible)
+    update_popup_release = release if visible else None
+    if release:
+        latest_tag = str(release.get("tag_name", "new version"))
+        update_popup_message.set_text(f"{latest_tag} is available. Current version is v{APP_VERSION}.")
+    for element in update_popup_elements:
+        if update_popup_visible:
+            element.show()
+        else:
+            element.hide()
+
+
+def run_update_check_worker():
+    global update_check_completed, update_check_result, update_check_error
+    try:
+        release = latest_release_metadata()
+        latest_tag = str(release.get("tag_name", ""))
+        if parse_version_tag(latest_tag) > parse_version_tag(APP_VERSION):
+            result = release
+        else:
+            result = None
+        with update_check_lock:
+            update_check_result = result
+            update_check_error = None
+            update_check_completed = True
+    except Exception as exc:
+        with update_check_lock:
+            update_check_result = None
+            update_check_error = str(exc)
+            update_check_completed = True
+        print(f"Update check failed: {exc}")
+
+
+def start_background_update_check():
+    global update_check_started
+    with update_check_lock:
+        if update_check_started:
+            return
+        update_check_started = True
+    Thread(target=run_update_check_worker, daemon=True).start()
+
+
+def maybe_show_update_popup():
+    global update_check_popup_shown
+    with update_check_lock:
+        release = update_check_result if update_check_completed else None
+        already_shown = update_check_popup_shown
+        if release is not None and not already_shown:
+            update_check_popup_shown = True
+    if release is not None and not already_shown:
+        latest_tag = str(release.get("tag_name", "new"))
+        settings_update_status_label.set_text(f"Update {latest_tag} available")
+        set_update_popup_visible(True, release)
 
 
 def select_release_asset(release):
@@ -2000,7 +2115,8 @@ def set_settings_panel_visible(visible):
 def sync_settings_fields():
     settings_simulator_dropdown.selected_option = "X-Plane" if xplane == 1 else "MSFS"
     settings_callsign_entry.set_text(MULTIPLAYER_CALLSIGN)
-    settings_status_label.set_text(f"{MULTIPLAYER_CALLSIGN} / {MULTIPLAYER_AIRCRAFT_TYPE}")
+    settings_version_label.set_text(f"v{APP_VERSION}")
+    settings_status_label.set_text(f"{MULTIPLAYER_CALLSIGN} {MULTIPLAYER_AIRCRAFT_TYPE}")
 
 
 def apply_sound_level(option):
@@ -10250,6 +10366,10 @@ while running:
 
 
 
+    if not update_check_started and time.time() >= update_check_start_time:
+        start_background_update_check()
+    maybe_show_update_popup()
+
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
@@ -10645,6 +10765,10 @@ while running:
                 set_settings_panel_visible(False)
             if event.ui_element == settings_update_button:
                 check_and_install_update()
+            if event.ui_element == update_popup_update_button:
+                check_and_install_update()
+            if event.ui_element == update_popup_later_button:
+                set_update_popup_visible(False)
             for row in contact_define_row_array:
                 if event.ui_element == row.broadcasting_checkbox:
                     row.set_broadcasting(not row.broadcasting_entered)
@@ -11660,6 +11784,14 @@ while running:
 stop_listen_audio()
 close_multiplayer_socket()
 pygame.quit() 
+
+
+
+
+
+
+
+
 
 
 

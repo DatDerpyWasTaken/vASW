@@ -106,7 +106,7 @@ DIFAR_DETECTION_UPDATE_INTERVAL_SEC = 0.20
 DIFAR_HIDDEN_DETECTION_UPDATE_INTERVAL_SEC = 1.50
 DIFAR_DETECTION_UPDATE_JITTER_SEC = 0.45
 SOUND_SPEED_MPS = 1500.0
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 GITHUB_OWNER = "DatDerpyWasTaken"
 GITHUB_REPO = "vASW"
 GITHUB_RELEASE_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
@@ -1136,8 +1136,10 @@ STATE_MENU = "menu"
 STATE_GAME = "game"
 state = STATE_MENU
 
+REAL_SUBMARINE_CLASS_OPTIONS = ["Kilo", "Akula", "Delta", "Borei", "Yasen"]
+
 internal_contact_type_list = {
-    "Sub-surface": ["Kilo", "Akula", "Delta", "Borei", "Yasen", "American", "Russian", "Illegal", "Submerged", "Unknown"],
+    "Sub-surface": ["Random"] + REAL_SUBMARINE_CLASS_OPTIONS + ["American", "Russian", "Illegal", "Submerged", "Unknown"],
     "Surface-Ship": [
         "Destroyer", "Frigate", "Carrier", "Civilian", "Cruise", "Fishing", "Hospital", "Cutter",
         "Tanker", "Triton", "Adelaide", "Juan Carlos", "Arleigh Burke", "Independence",
@@ -6361,7 +6363,7 @@ def set_sub_reaction_targets(contact, state, reduction_db, target_speed=None, ta
 
 
 def apply_sub_reaction_dynamics(contact, dt_seconds):
-    reduction_rate_db_s = 8.0
+    reduction_rate_db_s = 2.0
     speed_rate_kts_s = 1.2
     depth_rate_ft_s = 70.0
     turn_rate_deg_s = 5.0
@@ -6441,7 +6443,7 @@ def update_submarine_reactions(dt_seconds):
             set_sub_reaction_targets(
                 contact,
                 "EVADING",
-                26.0,
+                5.0,
                 target_speed=max(float(getattr(contact, "target_speed", 0) or 0), 14.0),
                 target_depth=min(10000, float(getattr(contact, "target_depth", contact.depth) or 0) + 900.0),
                 desired_bearing=getattr(contact, "desired_bearing", contact.bearing)
@@ -6450,7 +6452,7 @@ def update_submarine_reactions(dt_seconds):
             print_sub_behaviour(
                 contact,
                 "TORPEDO_EVADING",
-                f"TORPEDO EVASION: range {nearest_torpedo_nm:.2f} NM, turning toward {contact.desired_bearing:03.0f}, target speed {contact.target_speed:.1f} kt, quieting toward -26 dB"
+                f"TORPEDO EVASION: range {nearest_torpedo_nm:.2f} NM, turning toward {contact.desired_bearing:03.0f}, target speed {contact.target_speed:.1f} kt, quieting toward -5 dB"
             )
             continue
 
@@ -6459,14 +6461,14 @@ def update_submarine_reactions(dt_seconds):
             set_sub_reaction_targets(
                 contact,
                 "SILENT",
-                32.0,
+                4.0,
                 target_speed=min(float(getattr(contact, "target_speed", getattr(contact, "speed", 0)) or 0), 4.0)
             )
             apply_sub_reaction_dynamics(contact, dt_seconds)
             print_sub_behaviour(
                 contact,
                 "DICASS_SILENT",
-                f"DICASS NEARBY: silent running, slowing toward {contact.target_speed:.1f} kt, quieting toward -32 dB"
+                f"DICASS NEARBY: silent running, slowing toward {contact.target_speed:.1f} kt, quieting toward -4 dB"
             )
             continue
 
@@ -6475,24 +6477,24 @@ def update_submarine_reactions(dt_seconds):
             set_sub_reaction_targets(
                 contact,
                 "CAUTIOUS",
-                14.0,
+                2.0,
                 target_speed=min(float(getattr(contact, "target_speed", getattr(contact, "speed", 0)) or 0), 6.0)
             )
             apply_sub_reaction_dynamics(contact, dt_seconds)
             print_sub_behaviour(
                 contact,
                 "DIFAR_CAUTIOUS",
-                f"DIFAR SPLASH/BUOY CLOSE: nearest buoy {nearest_passive_buoy_nm:.2f} NM, slowing toward {contact.target_speed:.1f} kt, quieting toward -14 dB"
+                f"DIFAR SPLASH/BUOY CLOSE: nearest buoy {nearest_passive_buoy_nm:.2f} NM, slowing toward {contact.target_speed:.1f} kt, quieting toward -2 dB"
             )
             continue
 
         if now <= getattr(contact, "behaviour_until", 0.0):
             if getattr(contact, "behaviour_state", "NORMAL") == "EVADING":
-                set_sub_reaction_targets(contact, "EVADING", 20.0)
+                set_sub_reaction_targets(contact, "EVADING", 4.0)
             elif getattr(contact, "behaviour_state", "NORMAL") == "SILENT":
-                set_sub_reaction_targets(contact, "SILENT", 28.0)
+                set_sub_reaction_targets(contact, "SILENT", 3.0)
             else:
-                set_sub_reaction_targets(contact, "CAUTIOUS", 10.0)
+                set_sub_reaction_targets(contact, "CAUTIOUS", 1.5)
             apply_sub_reaction_dynamics(contact, dt_seconds)
             continue
 
@@ -7135,6 +7137,13 @@ sub_classes = {
     'Yasen': YasenSubmarine,
     'Emitter': BUTECEmitter
 }
+
+
+def resolve_submarine_class_selection(selected_class):
+    selected_class = str(selected_class or '').strip()
+    if selected_class.lower() == 'random':
+        return random.choice(REAL_SUBMARINE_CLASS_OPTIONS)
+    return selected_class
 
 
 # ---------------------------------------------------------------------------
@@ -10217,6 +10226,9 @@ for sub_conf in config["submarines"]:  # note plural "submarines"
     contact_acoustic_class = sub_conf.get("class", "Akula")
     internal_type = sub_conf.get("internal_type", "Sub-surface")
     internal_class = sub_conf.get("internal_class", contact_acoustic_class if internal_type == "Sub-surface" else "Unknown")
+    if internal_type == "Sub-surface" and (internal_class == "Random" or contact_acoustic_class == "Random"):
+        internal_class = resolve_submarine_class_selection("Random")
+        contact_acoustic_class = internal_class
     broadcasting = bool(sub_conf.get("broadcasting", internal_type == "Surface-Ship"))
     if internal_type == "Sub-surface":
         SubClass = sub_classes.get(contact_acoustic_class, AkulaSubmarine)  # get the correct subclass
@@ -10793,13 +10805,17 @@ while running:
                             depth=row.depth_entered,
                             bearing=row.bearing_entered
                         )
+                        resolved_internal_class = (
+                            resolve_submarine_class_selection(row.internal_class_entered)
+                            if row.internal_type_entered == "Sub-surface" else row.internal_class_entered
+                        )
                         new_contact.internal_type = row.internal_type_entered
-                        new_contact.internal_class = row.internal_class_entered
+                        new_contact.internal_class = resolved_internal_class
                         new_contact.broadcasting = row.broadcasting_entered
                         if row.selected_model != "Auto":
                             new_contact.gaist_model_title = row.selected_model
 
-                        acoustic_class = row.internal_class_entered if row.internal_type_entered == "Sub-surface" else ""
+                        acoustic_class = resolved_internal_class if row.internal_type_entered == "Sub-surface" else ""
                         contact_class = sub_classes.get(acoustic_class)
                         if contact_class is not None:
                             sub_instance = contact_class(
@@ -10986,6 +11002,9 @@ while running:
                     contact_acoustic_class = sub_conf.get("class", "Akula")
                     internal_type = sub_conf.get("internal_type", "Sub-surface")
                     internal_class = sub_conf.get("internal_class", contact_acoustic_class if internal_type == "Sub-surface" else "Unknown")
+                    if internal_type == "Sub-surface" and (internal_class == "Random" or contact_acoustic_class == "Random"):
+                        internal_class = resolve_submarine_class_selection("Random")
+                        contact_acoustic_class = internal_class
                     broadcasting = bool(sub_conf.get("broadcasting", internal_type == "Surface-Ship"))
                     selected_model = str(sub_conf.get("model", "Auto") or "Auto")
                     spawn_lat, spawn_lon = random_point_within_range_nm(
@@ -11109,8 +11128,8 @@ while running:
                     class_text = row.internal_class_entered if row.internal_type_entered == "Sub-surface" else ""
 
                 # Resolve class
-                if not class_text or class_text == "RANDOM":
-                    submarine_class = random.choice(list(sub_classes.keys()))
+                if not class_text or str(class_text).lower() == "random":
+                    submarine_class = resolve_submarine_class_selection("Random")
                 else:
                     submarine_class = class_text
 
@@ -11784,6 +11803,13 @@ while running:
 stop_listen_audio()
 close_multiplayer_socket()
 pygame.quit() 
+
+
+
+
+
+
+
 
 
 

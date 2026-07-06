@@ -1,4 +1,12 @@
 
+import os
+import sys
+
+DEDICATED_HOST_MODE = any(arg.lower() in ("--dedicated-host", "--host-server", "--server") for arg in sys.argv[1:])
+if DEDICATED_HOST_MODE:
+    os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+    os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+
 import pygame
 import math 
 import random
@@ -16,8 +24,6 @@ import pyscroll.data
 from pyscroll.group import PyscrollGroup
 from pytmx.util_pygame import load_pygame
 import json
-import os
-import sys
 import traceback
 import datetime
 import pyaudio
@@ -28,9 +34,11 @@ import socket
 import struct
 import uuid
 import urllib.request
+import urllib.parse
 import tempfile
 import zipfile
 import subprocess
+
 from SimConnect.Constants import SIMCONNECT_UNUSED
 from SimConnect.Enum import (
     SIMCONNECT_DATA_INITPOSITION,
@@ -59,6 +67,24 @@ COASTLINE_FILE = os.path.join("assets", "coastline.geojson")
 LAND_FILE = os.path.join("assets", "land.geojson")
 GAIST_MODEL_FILE = "gaist_models.json"
 GAIST_BOATS_DIR = os.path.join("gaist-ultra-V7_1", "SimObjects", "Boats")
+MODEL_LIBRARY_AUTO = "Auto"
+MODEL_LIBRARY_MILTECH = "Miltech Mission Hub"
+MODEL_LIBRARY_SEAFRONT = "Seafront Sightseeing"
+MODEL_LIBRARY_ALL = "All Libraries"
+MODEL_LIBRARY_OPTIONS = [
+    MODEL_LIBRARY_AUTO,
+    MODEL_LIBRARY_MILTECH,
+    MODEL_LIBRARY_SEAFRONT,
+    MODEL_LIBRARY_ALL
+]
+MODEL_LIBRARY_DIRS = {
+    MODEL_LIBRARY_MILTECH: ["Boats", GAIST_BOATS_DIR],
+    MODEL_LIBRARY_SEAFRONT: [
+        "seafront-sightseeing-vessels-uksw",
+        "seafront-sightseeing-vessels-uk-southeast-v2-6-0",
+        "seafront-sightseeing-vessels-core"
+    ]
+}
 TERRAIN_INDEX_CELL_DEG = 2
 LAND_RASTER_SIZE = (720, 360)
 coastline_polylines = []
@@ -72,29 +98,65 @@ radar_terrain_cache = {
 }
 ship_injection_enabled = False
 ship_injection_last_update = 0
-ship_injection_update_interval = 0.001
-ship_waypoint_update_interval = 30.0
-ship_injection_resync_interval = 60.0
+ship_injection_update_interval = 0.25
+ship_waypoint_update_interval = 0.0
+ship_injection_resync_interval = 20.0
+ship_motion_resend_interval = 5.0
+ship_motion_heading_epsilon_deg = 0.25
+ship_motion_speed_epsilon_kts = 0.1
 ship_injections = {}
 ship_visual_speed_multiplier = 1
-ship_visual_lead_seconds = 1.0
+ship_visual_lead_seconds = 0.0
 ship_deck_hold_radius_nm = 0.04
 ship_deck_hold_max_alt_ft = 120.0
-ship_deck_carry_enabled = True
+ship_deck_speed_tolerance_kt = 3.0
+ship_deck_altitude_stable_tolerance_ft = 2.5
+ship_deck_lock_settle_seconds = 0.35
+ship_deck_release_climb_ft = 4.0
+ship_deck_release_climb_rate_fps = 1.5
+ship_deck_hard_snap_interval_sec = 5.0
+manual_deck_snap_interval_sec = 0.5
+manual_deck_snap_deadband_m = 0.75
+ship_spawn_aft_forward_nm = -0.06
+ship_spawn_aft_right_nm = 0.0
+ship_route_arrival_radius_nm = 0.05
+ship_deck_carry_enabled = False
+manual_deck_lock_track = None
+ship_command_accel_kts_s = 0.35
+ship_command_decel_kts_s = 0.55
+ship_command_turn_rate_dps = 1.5
+ship_default_underway_speed_kts = 8.0
+shadow_catchup_speed_margin_kts = 8.0
+AISHUB_API_URL = "https://data.aishub.net/ws.php"
+AISHUB_MIN_REFRESH_SECONDS = 60.0
+AISHUB_DEFAULT_MAX_CONTACTS = 1000
+CIVILIAN_TRAFFIC_MIN_OFFSHORE_NM = 10.0
+CIVILIAN_TRAFFIC_MIN_RANGE_NM = 8.0
+CIVILIAN_TRAFFIC_MAX_RANGE_NM = 45.0
+CIVILIAN_TRAFFIC_GLOBAL_LAT_LIMIT = 72.0
+HOST_CIVILIAN_TRAFFIC_RADIUS_NM = 100.0
+HOST_CIVILIAN_TRAFFIC_TARGET_PER_PLAYER = 8
+HOST_CIVILIAN_TRAFFIC_REFRESH_SECONDS = 45.0
+host_civilian_traffic_last_update = 0.0
+aishub_last_fetch_at = 0.0
+aishub_last_error = ""
+aishub_disabled_notice_shown = False
 XPLANE_SHIP_EXPORT_FILE = "xplane_ships.json"
 XPLANE_UDP_HOST = "127.0.0.1"
 XPLANE_UDP_PORT = 49000
 XPLANE_MULTIPLAYER_SHIP_SLOTS = 19
 xplane_ship_last_export = 0.0
-xplane_ship_export_interval = 0.25
+xplane_ship_export_interval = 0.0
 xplane_ship_udp_socket = None
 xplane_ship_warning_shown = False
 ship_position_definition = None
 ship_waypoint_definition = None
+ship_motion_definition = None
 msfs_splash_effects = []
 msfs_splash_warning_shown = False
 gaist_model_config = {}
 gaist_civilian_model_titles = None
+model_library_title_cache = {}
 DIFAR_REFERENCE_RANGE_NM = 1.8
 DIFAR_MIN_SNR_DB = 6.0
 DIFAR_CLEAR_SNR_DB = 35.0
@@ -106,7 +168,7 @@ DIFAR_DETECTION_UPDATE_INTERVAL_SEC = 0.20
 DIFAR_HIDDEN_DETECTION_UPDATE_INTERVAL_SEC = 1.50
 DIFAR_DETECTION_UPDATE_JITTER_SEC = 0.45
 SOUND_SPEED_MPS = 1500.0
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.3.2"
 GITHUB_OWNER = "DatDerpyWasTaken"
 GITHUB_REPO = "vASW"
 GITHUB_RELEASE_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
@@ -116,19 +178,44 @@ MULTIPLAYER_PORT = 51423
 MULTIPLAYER_BROADCAST_INTERVAL = 0.25
 MULTIPLAYER_STATE_BROADCAST_INTERVAL = 1.0
 MULTIPLAYER_STALE_SECONDS = 8.0
+MULTIPLAYER_CONTACT_PASSWORD = os.environ.get("VASW_CONTACT_PASSWORD", "d0yl3!))")
+MULTIPLAYER_CONTACT_CONTRIBUTION_INTERVAL = 1.5
 MULTIPLAYER_ID = str(uuid.uuid4())
 MULTIPLAYER_CALLSIGN = os.environ.get("COMPUTERNAME", "AIRCRAFT")[:12]
 MULTIPLAYER_AIRCRAFT_TYPE = "P8"
 MULTIPLAYER_AIRCRAFT_TYPES = ["P8", "P3", "C130", "C30J", "A400", "B350", "EH10", "H60", "SH60", "NH90", "AW139"]
+MULTIPLAYER_PLAYER_TYPES = ["Aircraft", "Ship", "Submarine"]
+MULTIPLAYER_TEAMS = ["BLUFOR", "REDFOR", "Neutral"]
+CONTACT_TEAM_OPTIONS = ["BLUFOR", "REDFOR", "Neutral"]
+MULTIPLAYER_PLAYER_TYPE = "Aircraft"
+MULTIPLAYER_TEAM = "BLUFOR"
+ownship_commanded_heading = 120.0
+ownship_current_heading = 120.0
+ownship_last_heading = 120.0
+ownship_heading_rate_dps = 0.0
+ownship_commanded_speed = 0.0
+ownship_current_speed = 0.0
+ownship_commanded_depth = 0.0
+ownship_current_depth = 0.0
+ownship_route_waypoints = []
+ownship_route_index = 0
+ownship_route_active = False
+ownship_route_status = "No route"
+ownship_control_contact_key = "Auto"
+ownship_control_contact_track = None
+ownship_control_contact_options = ["Auto"]
+ownship_control_initialized_track = None
 multiplayer_role = "OFF"
 multiplayer_enabled = False
 multiplayer_socket = None
 multiplayer_last_broadcast = 0.0
 multiplayer_last_host_broadcast = 0.0
 multiplayer_last_state_broadcast = 0.0
+multiplayer_last_contact_contribution = 0.0
 multiplayer_host_seen = None
 multiplayer_peers = {}
 multiplayer_channel_assignments = {}
+multiplayer_contact_password = ""
 player_channel_range = (1, 99)
 
 if not os.path.exists(LOG_FILE):
@@ -159,6 +246,52 @@ def load_gaist_model_config(path=GAIST_MODEL_FILE):
 
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def normalize_model_library(library):
+    library = str(library or MODEL_LIBRARY_AUTO).strip()
+    return library if library in MODEL_LIBRARY_OPTIONS else MODEL_LIBRARY_AUTO
+
+
+def discover_model_titles_from_dirs(paths):
+    titles = []
+    title_re = re.compile(r"^\s*title\s*=\s*(.+?)\s*$", re.IGNORECASE)
+    for base_dir in paths:
+        if not os.path.isdir(base_dir):
+            continue
+        for root, _, files in os.walk(base_dir):
+            cfg_name = next((name for name in files if name.lower() == "sim.cfg"), None)
+            if cfg_name is None:
+                continue
+            cfg_path = os.path.join(root, cfg_name)
+            try:
+                with open(cfg_path, "r", encoding="utf-8", errors="ignore") as cfg:
+                    text = cfg.read()
+            except OSError:
+                continue
+            for line in text.splitlines():
+                match = title_re.match(line)
+                if match:
+                    titles.append(match.group(1).strip())
+    return sorted(set(title for title in titles if title))
+
+
+def discovered_model_titles_for_library(library):
+    library = normalize_model_library(library)
+    if library == MODEL_LIBRARY_AUTO:
+        library = MODEL_LIBRARY_MILTECH
+    if library == MODEL_LIBRARY_ALL:
+        titles = []
+        for option in (MODEL_LIBRARY_MILTECH, MODEL_LIBRARY_SEAFRONT):
+            for title in discovered_model_titles_for_library(option):
+                if title not in titles:
+                    titles.append(title)
+        return sorted(titles)
+    if library in model_library_title_cache:
+        return model_library_title_cache[library]
+    titles = discover_model_titles_from_dirs(MODEL_LIBRARY_DIRS.get(library, []))
+    model_library_title_cache[library] = titles
+    return titles
 
 
 def discover_gaist_civilian_model_titles():
@@ -197,8 +330,13 @@ def discover_gaist_civilian_model_titles():
     return sorted(set(titles))
 
 
-def random_gaist_civilian_model_title():
+def random_gaist_civilian_model_title(model_library=MODEL_LIBRARY_AUTO):
     global gaist_civilian_model_titles
+
+    model_library = normalize_model_library(model_library)
+    if model_library not in (MODEL_LIBRARY_AUTO, MODEL_LIBRARY_ALL):
+        library_titles = discovered_model_titles_for_library(model_library)
+        return random.choice(library_titles) if library_titles else ""
 
     configured_titles = gaist_model_config.get("civilian_models", [])
     if isinstance(configured_titles, str):
@@ -241,6 +379,7 @@ def all_configured_model_titles():
         elif isinstance(value, dict):
             titles.extend(value.values())
     titles.extend(discover_gaist_civilian_model_titles())
+    titles.extend(discovered_model_titles_for_library(MODEL_LIBRARY_MILTECH))
     cleaned = []
     for title in titles:
         title = str(title or "").strip()
@@ -249,16 +388,44 @@ def all_configured_model_titles():
     return sorted(cleaned)
 
 
-def model_options_for_contact(internal_type, internal_class):
+def model_titles_for_library(model_library):
+    model_library = normalize_model_library(model_library)
+    if model_library == MODEL_LIBRARY_AUTO:
+        return all_configured_model_titles()
+    if model_library == MODEL_LIBRARY_ALL:
+        titles = all_configured_model_titles()
+        for title in discovered_model_titles_for_library(MODEL_LIBRARY_SEAFRONT):
+            if title not in titles:
+                titles.append(title)
+        return sorted(titles)
+    if model_library == MODEL_LIBRARY_MILTECH:
+        return all_configured_model_titles()
+    return discovered_model_titles_for_library(model_library)
+
+
+def compact_model_options(selected_model="Auto"):
+    selected_model = str(selected_model or "Auto")
     options = ["Auto"]
-    preferred = configured_model_title_for_type(internal_type, internal_class)
-    if preferred and preferred not in options:
-        options.append(preferred)
-    if internal_type == "Surface-Ship" and internal_class == "Civilian":
-        for title in gaist_model_config.get("civilian_models", []):
-            if title and title not in options:
-                options.append(title)
-    for title in all_configured_model_titles():
+    if selected_model != "Auto" and selected_model not in options:
+        options.append(selected_model)
+    return options
+
+
+def model_options_for_contact(internal_type, internal_class, model_library=MODEL_LIBRARY_AUTO):
+    model_library = normalize_model_library(model_library)
+    options = ["Auto"]
+    if model_library != MODEL_LIBRARY_SEAFRONT:
+        preferred = configured_model_title_for_type(internal_type, internal_class)
+        if preferred and preferred not in options:
+            options.append(preferred)
+        if internal_type == "Surface-Ship" and internal_class == "Civilian":
+            civilian_titles = gaist_model_config.get("civilian_models", [])
+            if isinstance(civilian_titles, str):
+                civilian_titles = [civilian_titles]
+            for title in civilian_titles:
+                if title and title not in options:
+                    options.append(title)
+    for title in model_titles_for_library(model_library):
         if title not in options:
             options.append(title)
     return options
@@ -278,16 +445,22 @@ def gaist_model_title_for_contact(contact):
         return explicit_model
     contact_type = getattr(contact, "internal_type", "")
     contact_class = getattr(contact, "internal_class", "Unknown")
+    model_library = normalize_model_library(getattr(contact, "model_library", MODEL_LIBRARY_AUTO))
     if contact_type == "Surface-Ship" and contact_class == "Civilian":
         if not getattr(contact, "gaist_model_title", ""):
-            contact.gaist_model_title = random_gaist_civilian_model_title()
+            contact.gaist_model_title = random_gaist_civilian_model_title(model_library)
         model_title = contact.gaist_model_title
     else:
-        model_title = configured_model_title_for_type(contact_type, contact_class)
+        model_title = ""
+        if model_library not in (MODEL_LIBRARY_SEAFRONT,):
+            model_title = configured_model_title_for_type(contact_type, contact_class)
+            if not model_title and contact_type == "Surface-Ship":
+                model_title = configured_model_title_for_type("Surface-Ship", "Unknown")
+            if not model_title and contact_type == "Surface-Ship":
+                model_title = gaist_model_config.get("default", "")
         if not model_title and contact_type == "Surface-Ship":
-            model_title = configured_model_title_for_type("Surface-Ship", "Unknown")
-        if not model_title and contact_type == "Surface-Ship":
-            model_title = gaist_model_config.get("default", "")
+            library_titles = model_titles_for_library(model_library)
+            model_title = random.choice(library_titles) if library_titles else ""
 
     return resolve_gaist_model_title(model_title)
 
@@ -330,8 +503,55 @@ def ensure_msfs_connection():
 
 
 def ship_sim_speed_kts(contact):
-    return max(1.0, float(getattr(contact, "speed", 0) or 0) * ship_visual_speed_multiplier)
+    return max(0.0, float(getattr(contact, "speed", 0) or 0) * ship_visual_speed_multiplier)
 
+def ship_approach_value(current, target, max_delta):
+    current = float(current or 0.0)
+    target = float(target or 0.0)
+    max_delta = max(0.0, float(max_delta or 0.0))
+    if current < target:
+        return min(target, current + max_delta)
+    return max(target, current - max_delta)
+
+
+def ship_approach_bearing(current, target, max_delta):
+    current = float(current or 0.0) % 360.0
+    target = float(target or 0.0) % 360.0
+    error = (target - current + 180.0) % 360.0 - 180.0
+    return (current + max(-max_delta, min(max_delta, error))) % 360.0
+
+
+def ensure_ship_command_state(contact):
+    current_speed = max(0.0, float(getattr(contact, "speed", 0.0) or 0.0))
+    current_heading = float(getattr(contact, "bearing", 0.0) or 0.0) % 360.0
+    if not hasattr(contact, "commanded_speed"):
+        contact.commanded_speed = current_speed
+    if not hasattr(contact, "commanded_heading"):
+        contact.commanded_heading = current_heading
+    if not hasattr(contact, "ship_underway_speed"):
+        contact.ship_underway_speed = max(current_speed, float(getattr(contact, "original_speed", 0.0) or 0.0), ship_default_underway_speed_kts)
+    return contact
+
+
+def ship_commanded_stopped(contact):
+    ensure_ship_command_state(contact)
+    return float(getattr(contact, "commanded_speed", 0.0) or 0.0) <= 0.2
+
+
+def apply_ship_command_dynamics(contact, dt_seconds):
+    if getattr(contact, "internal_type", "") != "Surface-Ship":
+        return
+    ensure_ship_command_state(contact)
+    dt_seconds = max(0.0, float(dt_seconds or 0.0))
+    current_speed = max(0.0, float(getattr(contact, "speed", 0.0) or 0.0))
+    target_speed = max(0.0, float(getattr(contact, "commanded_speed", current_speed) or 0.0))
+    speed_rate = ship_command_accel_kts_s if target_speed > current_speed else ship_command_decel_kts_s
+    contact.speed = ship_approach_value(current_speed, target_speed, speed_rate * dt_seconds)
+    contact.bearing = ship_approach_bearing(
+        float(getattr(contact, "bearing", 0.0) or 0.0),
+        float(getattr(contact, "commanded_heading", getattr(contact, "bearing", 0.0)) or 0.0),
+        ship_command_turn_rate_dps * dt_seconds
+    )
 
 def ship_visual_latlon(contact, lead_seconds=0.0):
     start_lat = float(contact.contact_lat)
@@ -365,95 +585,396 @@ def ship_init_position(contact, lead_seconds=0.0, visual_state=None):
     init_pos.Bank = 0
     init_pos.Heading = visual_bearing
     init_pos.OnGround = 1
-    init_pos.Airspeed = int(round(visual_speed))
+    init_pos.Airspeed = 0
     return init_pos
 
 
-def aircraft_on_ship_deck(injection):
+def current_aircraft_deck_altitude_ft():
+    try:
+        return float(plane_altitude_ft if plane_altitude_ft is not None else alt)
+    except (TypeError, ValueError):
+        return None
+
+
+def ship_deck_relative_offset_nm(ship_lat, ship_lon, ship_heading_deg, own_lat, own_lon):
+    distance_nm = haversine(ship_lat, ship_lon, own_lat, own_lon)
+    bearing_to_aircraft = haversine_bearing(ship_lat, ship_lon, own_lat, own_lon)
+    rel_rad = math.radians((bearing_to_aircraft - ship_heading_deg + 180.0) % 360.0 - 180.0)
+    return math.cos(rel_rad) * distance_nm, math.sin(rel_rad) * distance_nm
+
+
+def ship_deck_target_latlon(ship_lat, ship_lon, ship_heading_deg, forward_nm, right_nm):
+    distance_nm = math.hypot(forward_nm, right_nm)
+    if distance_nm <= 1e-7:
+        return ship_lat, ship_lon
+    rel_bearing_deg = math.degrees(math.atan2(right_nm, forward_nm))
+    return destination_from_bearing(ship_lat, ship_lon, (ship_heading_deg + rel_bearing_deg) % 360.0, distance_nm)
+
+
+def ship_deck_lock_is_active_for_contact(contact):
+    if not ship_deck_carry_enabled:
+        return False
+    injection = ship_injections.get(getattr(contact, "track_number", None))
+    return bool(getattr(contact, "manual_deck_lock_active", False) or (injection and injection.get("deck_lock_active")))
+
+
+def release_ship_deck_lock(injection, reason="released"):
+    if injection.get("deck_lock_active"):
+        print(f"MSFS deck carry {reason} for track {injection.get('track_number', '?')}")
+    injection["deck_lock_active"] = False
+    injection["deck_candidate_since"] = None
+    injection.pop("deck_lock_forward_nm", None)
+    injection.pop("deck_lock_right_nm", None)
+    injection.pop("deck_lock_alt_ft", None)
+    injection.pop("deck_next_hard_snap_at", None)
+
+def find_contact_by_track_number(track_number):
+    for contact in contacts:
+        if getattr(contact, "track_number", None) == track_number:
+            return contact
+    return None
+
+
+def ship_deck_reference_state(contact):
+    injection = ship_injections.get(getattr(contact, "track_number", None))
+    if injection is not None:
+        ship_lat = float(injection.get("visual_lat", getattr(contact, "contact_lat", 0.0)))
+        ship_lon = float(injection.get("visual_lon", getattr(contact, "contact_long", 0.0)))
+        ship_heading = float(injection.get("visual_bearing", getattr(contact, "bearing", 0.0)) or 0.0) % 360.0
+        ship_speed = float(injection.get("visual_speed", getattr(contact, "speed", 0.0)) or 0.0)
+    else:
+        ship_lat = float(getattr(contact, "contact_lat", 0.0))
+        ship_lon = float(getattr(contact, "contact_long", 0.0))
+        ship_heading = float(getattr(contact, "bearing", 0.0) or 0.0) % 360.0
+        ship_speed = float(getattr(contact, "speed", 0.0) or 0.0)
+    return ship_lat, ship_lon, ship_heading, ship_speed
+
+
+def clear_contact_deck_lock(contact):
+    global manual_deck_lock_track
+    contact.manual_deck_lock_active = False
+    for attr in ("deck_lock_forward_nm", "deck_lock_right_nm", "deck_lock_alt_ft", "deck_next_hard_snap_at", "deck_last_alt_ft", "deck_last_alt_time"):
+        if hasattr(contact, attr):
+            delattr(contact, attr)
+    injection = ship_injections.get(getattr(contact, "track_number", None))
+    if injection is not None:
+        release_ship_deck_lock(injection, "manually unlocked")
+    if manual_deck_lock_track == getattr(contact, "track_number", None):
+        manual_deck_lock_track = None
+
+
+def set_aircraft_deck_position(altitude_ft, target_lat, target_lon, speed_kts, heading_deg, track_number="?"):
+    attempts = (
+        (1, "ground"),
+        (0, "airborne"),
+    )
+    last_error = None
+    for on_ground, mode_label in attempts:
+        try:
+            carried = sm.set_pos(
+                altitude_ft,
+                target_lat,
+                target_lon,
+                int(round(max(0.0, float(speed_kts or 0.0)))),
+                _Heading=float(heading_deg or 0.0),
+                _OnGround=on_ground
+            )
+        except Exception as exc:
+            last_error = exc
+            carried = False
+        if carried:
+            return True, mode_label
+    if last_error is not None:
+        print(f"MSFS deck hard snap failed for track {track_number}: {last_error}")
+    else:
+        print(
+            f"MSFS deck hard snap rejected for track {track_number}: "
+            f"{target_lat:.6f}, {target_lon:.6f}, alt {altitude_ft:.1f} ft"
+        )
+    return False, None
+
+
+def snap_aircraft_to_contact_deck(contact, force=False):
+    global lat, long, manual_deck_lock_track
     if xplane != 0:
+        print("Deck lock is only available in MSFS mode")
+        return False
+    if not ensure_msfs_connection():
+        print("Deck lock unavailable: simulator connection unavailable")
+        return False
+    altitude_ft = current_aircraft_deck_altitude_ft()
+    if altitude_ft is None or not math.isfinite(altitude_ft):
+        print(f"Deck lock unavailable for track {getattr(contact, 'track_number', '?')}: invalid altitude")
+        return False
+
+    now = time.time()
+    last_alt = getattr(contact, "deck_last_alt_ft", None)
+    last_time = getattr(contact, "deck_last_alt_time", now)
+    altitude_delta = 0.0 if last_alt is None else altitude_ft - float(last_alt)
+    elapsed = max(0.001, now - float(last_time or now))
+    altitude_rate_fps = altitude_delta / elapsed if last_alt is not None else 0.0
+    contact.deck_last_alt_ft = altitude_ft
+    contact.deck_last_alt_time = now
+
+    lock_alt = float(getattr(contact, "deck_lock_alt_ft", altitude_ft))
+    if not force and (altitude_ft > lock_alt + ship_deck_release_climb_ft or altitude_rate_fps > ship_deck_release_climb_rate_fps):
+        clear_contact_deck_lock(contact)
+        print(f"MSFS deck lock released: climb detected for track {getattr(contact, 'track_number', '?')}")
+        return False
+
+    if not force and now < float(getattr(contact, "deck_next_hard_snap_at", 0.0) or 0.0):
+        return False
+
+    ship_lat, ship_lon, ship_heading, ship_speed = ship_deck_reference_state(contact)
+    target_lat, target_lon = ship_deck_target_latlon(
+        ship_lat,
+        ship_lon,
+        ship_heading,
+        float(getattr(contact, "deck_lock_forward_nm", 0.0)),
+        float(getattr(contact, "deck_lock_right_nm", 0.0))
+    )
+    manual_lock_active = getattr(contact, "manual_deck_lock_active", False)
+    snap_interval = manual_deck_snap_interval_sec if manual_lock_active else ship_deck_hard_snap_interval_sec
+    if manual_lock_active and not force:
+        try:
+            drift_m = haversine(float(lat), float(long), target_lat, target_lon) * 1852.0
+        except (TypeError, ValueError):
+            drift_m = manual_deck_snap_deadband_m + 1.0
+        if drift_m < manual_deck_snap_deadband_m:
+            contact.deck_next_hard_snap_at = now + snap_interval
+            return False
+
+    carried, snap_mode = set_aircraft_deck_position(
+        altitude_ft,
+        target_lat,
+        target_lon,
+        ship_speed,
+        float(hdg or ship_heading or 0.0),
+        getattr(contact, "track_number", "?")
+    )
+    if carried:
+        lat = target_lat
+        long = target_lon
+        snap_interval = manual_deck_snap_interval_sec if getattr(contact, "manual_deck_lock_active", False) else ship_deck_hard_snap_interval_sec
+        contact.deck_next_hard_snap_at = now + snap_interval
+        manual_deck_lock_track = getattr(contact, "track_number", None)
+        if force:
+            print(f"MSFS deck hard snap for track {getattr(contact, 'track_number', '?')} ({snap_mode})")
+    else:
+        contact.deck_next_hard_snap_at = now + 1.0
+    return bool(carried)
+
+
+def force_ship_deck_lock(contact):
+    global manual_deck_lock_track
+    if not ship_deck_carry_enabled:
+        print("Deck lock is disabled")
+        return False
+    if xplane != 0:
+        print("Deck lock is only available in MSFS mode")
         return False
     try:
         own_lat = float(lat)
         own_lon = float(long)
-        own_alt = float(alt)
-        ship_lat = float(injection.get("visual_lat"))
-        ship_lon = float(injection.get("visual_lon"))
+        ship_lat, ship_lon, ship_heading, _ = ship_deck_reference_state(contact)
     except (TypeError, ValueError):
+        print(f"Deck lock unavailable for track {getattr(contact, 'track_number', '?')}: invalid position data")
         return False
-    if not all(math.isfinite(value) for value in (own_lat, own_lon, own_alt, ship_lat, ship_lon)):
+    altitude_ft = current_aircraft_deck_altitude_ft()
+    if altitude_ft is None or not math.isfinite(altitude_ft):
+        print(f"Deck lock unavailable for track {getattr(contact, 'track_number', '?')}: invalid altitude")
         return False
-    if own_alt > ship_deck_hold_max_alt_ft:
+    forward_nm, right_nm = ship_deck_relative_offset_nm(ship_lat, ship_lon, ship_heading, own_lat, own_lon)
+    contact.manual_deck_lock_active = True
+    contact.deck_lock_forward_nm = forward_nm
+    contact.deck_lock_right_nm = right_nm
+    contact.deck_lock_alt_ft = altitude_ft
+    contact.deck_last_alt_ft = altitude_ft
+    contact.deck_last_alt_time = time.time()
+    contact.deck_next_hard_snap_at = 0.0
+    manual_deck_lock_track = getattr(contact, "track_number", None)
+
+    injection = ship_injections.get(getattr(contact, "track_number", None))
+    if injection is not None:
+        release_ship_deck_lock(injection, "manual deck lock moved to contact snap")
+
+    print(
+        f"MSFS deck carry manually locked for track {getattr(contact, 'track_number', '?')} "
+        f"offset FWD {forward_nm * 6076.12:.0f} ft RIGHT {right_nm * 6076.12:.0f} ft"
+    )
+    snap_aircraft_to_contact_deck(contact, force=True)
+    return True
+
+
+
+def spawn_aircraft_aft_of_ship(contact):
+    global lat, long, hdg
+    if xplane != 0:
+        print("Ship aft spawn is only available in MSFS mode")
         return False
-    return haversine(own_lat, own_lon, ship_lat, ship_lon) <= ship_deck_hold_radius_nm
+    if not ensure_msfs_connection():
+        print("Ship aft spawn unavailable: simulator connection unavailable")
+        return False
+    if contact is None:
+        print("Ship aft spawn ignored: select a surface ship contact first")
+        return False
+
+    try:
+        ship_lat, ship_lon, ship_heading, ship_speed = ship_deck_reference_state(contact)
+        target_lat, target_lon = ship_deck_target_latlon(
+            ship_lat,
+            ship_lon,
+            ship_heading,
+            ship_spawn_aft_forward_nm,
+            ship_spawn_aft_right_nm
+        )
+    except (TypeError, ValueError):
+        print(f"Ship aft spawn unavailable for track {getattr(contact, 'track_number', '?')}: invalid ship position")
+        return False
+
+    altitude_ft = current_aircraft_deck_altitude_ft()
+    if altitude_ft is None or not math.isfinite(altitude_ft):
+        print(f"Ship aft spawn unavailable for track {getattr(contact, 'track_number', '?')}: invalid aircraft altitude")
+        return False
+
+    carried, snap_mode = set_aircraft_deck_position(
+        altitude_ft,
+        target_lat,
+        target_lon,
+        ship_speed,
+        ship_heading,
+        getattr(contact, "track_number", "?")
+    )
+    if carried:
+        lat = target_lat
+        long = target_lon
+        hdg = ship_heading
+        print(
+            f"MSFS spawned aircraft aft of ship track {getattr(contact, 'track_number', '?')} "
+            f"({snap_mode}, {abs(ship_spawn_aft_forward_nm) * 6076.12:.0f} ft aft)"
+        )
+        return True
+    return False
+def toggle_ship_deck_lock(contact):
+    if ship_deck_lock_is_active_for_contact(contact):
+        clear_contact_deck_lock(contact)
+        print(f"MSFS deck lock manually unlocked for track {getattr(contact, 'track_number', '?')}")
+        return False
+    return force_ship_deck_lock(contact)
+
+
+def update_manual_deck_lock():
+    if not ship_deck_carry_enabled:
+        return
+    if manual_deck_lock_track is None:
+        return
+    contact = find_contact_by_track_number(manual_deck_lock_track)
+    if contact is None or not getattr(contact, "manual_deck_lock_active", False):
+        return
+    snap_aircraft_to_contact_deck(contact, force=False)
 
 
 def carry_aircraft_with_ship_delta(injection, old_lat, old_lon, new_lat, new_lon, visual_speed, bearing_deg):
     global lat, long, plane_altitude_ft, aircraft_groundspeed_kt
     if not ship_deck_carry_enabled or xplane != 0:
         return False
+
+    now = time.time()
     try:
         own_lat = float(lat)
         own_lon = float(long)
-        altitude_ft = float(plane_altitude_ft if plane_altitude_ft is not None else alt)
+        ship_lat = float(new_lat)
+        ship_lon = float(new_lon)
+        visual_speed = max(0.0, float(visual_speed or 0.0))
+        bearing_deg = float(bearing_deg or 0.0) % 360.0
+        aircraft_speed = max(0.0, float(aircraft_groundspeed_kt or 0.0))
     except (TypeError, ValueError):
+        release_ship_deck_lock(injection, "released: invalid aircraft/ship data")
         return False
-    delta_lat = float(new_lat) - float(old_lat)
-    delta_lon = float(new_lon) - float(old_lon)
-    if abs(delta_lat) < 1e-10 and abs(delta_lon) < 1e-10:
+
+    altitude_ft = current_aircraft_deck_altitude_ft()
+    if altitude_ft is None or not math.isfinite(altitude_ft):
+        release_ship_deck_lock(injection, "released: invalid altitude")
         return False
-    try:
-        heading_deg = float(hdg or bearing_deg or 0.0)
-    except (TypeError, ValueError):
-        heading_deg = float(bearing_deg or 0.0)
-    try:
-        airspeed = max(0.0, float(aircraft_groundspeed_kt or visual_speed or 0.0))
-    except (TypeError, ValueError):
-        airspeed = 0.0
-    try:
-        carried = sm.set_pos(
+
+    last_alt = injection.get("deck_last_alt_ft")
+    last_time = injection.get("deck_last_alt_time")
+    altitude_delta = 0.0 if last_alt is None else altitude_ft - float(last_alt)
+    elapsed = max(0.001, now - float(last_time or now))
+    altitude_rate_fps = altitude_delta / elapsed if last_alt is not None else 0.0
+    injection["deck_last_alt_ft"] = altitude_ft
+    injection["deck_last_alt_time"] = now
+
+    if injection.get("deck_lock_active"):
+        lock_alt = float(injection.get("deck_lock_alt_ft", altitude_ft))
+        if altitude_ft > lock_alt + ship_deck_release_climb_ft or altitude_rate_fps > ship_deck_release_climb_rate_fps:
+            release_ship_deck_lock(injection, "released: climb detected")
+            return False
+
+        forward_nm = float(injection.get("deck_lock_forward_nm", 0.0))
+        right_nm = float(injection.get("deck_lock_right_nm", 0.0))
+        target_lat, target_lon = ship_deck_target_latlon(ship_lat, ship_lon, bearing_deg, forward_nm, right_nm)
+        hard_snap_due = now >= float(injection.get("deck_next_hard_snap_at", 0.0) or 0.0)
+        if not hard_snap_due:
+            return False
+        carried, snap_mode = set_aircraft_deck_position(
             altitude_ft,
-            own_lat + delta_lat,
-            own_lon + delta_lon,
-            airspeed,
-            _Heading=heading_deg,
-            _OnGround=1
+            target_lat,
+            target_lon,
+            visual_speed,
+            float(hdg or bearing_deg or 0.0),
+            injection.get("track_number", "?")
         )
-    except Exception as exc:
-        print(f"MSFS deck carry failed: {exc}")
+        injection["deck_next_hard_snap_at"] = now + (ship_deck_hard_snap_interval_sec if carried else 1.0)
+        if carried:
+            print(f"MSFS deck hard snap for track {injection.get('track_number', '?')} ({snap_mode})")
+            lat = target_lat
+            long = target_lon
+        return bool(carried)
+
+    distance_nm = haversine(own_lat, own_lon, ship_lat, ship_lon)
+    speed_matches = abs(aircraft_speed - visual_speed) <= ship_deck_speed_tolerance_kt
+    altitude_stable = last_alt is not None and abs(altitude_delta) <= ship_deck_altitude_stable_tolerance_ft
+    in_capture_zone = distance_nm <= ship_deck_hold_radius_nm and altitude_ft <= ship_deck_hold_max_alt_ft
+
+    if not (in_capture_zone and speed_matches and altitude_stable):
+        injection["deck_candidate_since"] = None
         return False
-    if carried:
-        lat = own_lat + delta_lat
-        long = own_lon + delta_lon
-    return bool(carried)
+
+    candidate_since = injection.get("deck_candidate_since")
+    if candidate_since is None:
+        injection["deck_candidate_since"] = now
+        return False
+    if now - float(candidate_since) < ship_deck_lock_settle_seconds:
+        return False
+
+    forward_nm, right_nm = ship_deck_relative_offset_nm(ship_lat, ship_lon, bearing_deg, own_lat, own_lon)
+    injection["deck_lock_active"] = True
+    injection["deck_lock_forward_nm"] = forward_nm
+    injection["deck_lock_right_nm"] = right_nm
+    injection["deck_lock_alt_ft"] = altitude_ft
+    injection["deck_next_hard_snap_at"] = now + ship_deck_hard_snap_interval_sec
+    print(
+        f"MSFS deck carry active for track {injection.get('track_number', '?')} "
+        f"offset FWD {forward_nm * 6076.12:.0f} ft RIGHT {right_nm * 6076.12:.0f} ft"
+    )
+    return True
+
 
 def advance_ship_visual_state(injection, contact, now):
-    speed_kts = ship_sim_speed_kts(contact)
-    bearing_deg = float(getattr(contact, "bearing", 0) or 0) % 360
     last_update = float(injection.get("visual_update_at", now) or now)
     elapsed = max(0.0, min(0.25, now - last_update))
+    speed_kts = ship_sim_speed_kts(contact)
+    bearing_deg = float(getattr(contact, "bearing", 0) or 0) % 360
     lat = float(injection.get("visual_lat", contact.contact_lat))
     lon = float(injection.get("visual_lon", contact.contact_long))
 
     old_lat, old_lon = lat, lon
-    on_deck = aircraft_on_ship_deck(injection)
-    if on_deck and not injection.get("deck_carry_logged"):
-        print(f"MSFS deck carry active for track {getattr(contact, 'track_number', '?')}")
-        injection["deck_carry_logged"] = True
-    elif not on_deck and injection.get("deck_carry_logged"):
-        print(f"MSFS deck carry released for track {getattr(contact, 'track_number', '?')}")
-        injection["deck_carry_logged"] = False
-
     if elapsed > 0:
         lat, lon = destination_from_bearing(lat, lon, bearing_deg, speed_kts * elapsed / 3600.0)
-        if on_deck:
-            carry_aircraft_with_ship_delta(injection, old_lat, old_lon, lat, lon, speed_kts, bearing_deg)
-
-    # Do not continuously pull the visual object back to the tactical contact;
-    # that fights SimConnect and causes visible back-and-forth jitter. Only snap
-    # if the contact has clearly jumped or the mission was reloaded.
+    carry_aircraft_with_ship_delta(injection, old_lat, old_lon, lat, lon, speed_kts, bearing_deg)
     target_lat, target_lon = ship_visual_latlon(contact, ship_visual_lead_seconds)
-    if haversine(lat, lon, target_lat, target_lon) > 5.0:
-        lat, lon = target_lat, target_lon
+    injection["visual_drift_nm"] = haversine(lat, lon, target_lat, target_lon)
 
     injection["visual_lat"] = lat
     injection["visual_lon"] = lon
@@ -541,8 +1062,8 @@ def make_ship_waypoint(lat_deg, lon_deg, speed_kts, flags):
     waypoint.Longitude = float(lon_deg)
     waypoint.Altitude = 0
     waypoint.Flags = int(flags)
-    waypoint.ktsSpeed = float(max(1.0, speed_kts))
-    waypoint.percentThrottle = 60
+    waypoint.ktsSpeed = float(max(0.0, speed_kts))
+    waypoint.percentThrottle = 0 if waypoint.ktsSpeed <= 0.1 else 60
     return waypoint
 
 
@@ -590,6 +1111,86 @@ def set_injected_ship_waypoints(object_id, contact, visual_state=None):
         return False
 
 
+
+def ensure_ship_motion_definition():
+    global ship_motion_definition
+
+    if ship_motion_definition is not None:
+        return ship_motion_definition
+
+    ship_motion_definition = sm.new_def_id()
+    sm.dll.AddToDataDefinition(
+        sm.hSimConnect,
+        ship_motion_definition.value,
+        b"AI DESIRED SPEED",
+        b"Knots",
+        SIMCONNECT_DATATYPE.SIMCONNECT_DATATYPE_FLOAT64,
+        0,
+        SIMCONNECT_UNUSED
+    )
+    sm.dll.AddToDataDefinition(
+        sm.hSimConnect,
+        ship_motion_definition.value,
+        b"AI DESIRED HEADING",
+        b"Degrees",
+        SIMCONNECT_DATATYPE.SIMCONNECT_DATATYPE_FLOAT64,
+        0,
+        SIMCONNECT_UNUSED
+    )
+    return ship_motion_definition
+
+
+def set_injected_ship_motion(object_id, contact, visual_state=None):
+    if not ensure_msfs_connection():
+        return False
+
+    if visual_state is None:
+        speed_kts = ship_sim_speed_kts(contact)
+        heading_deg = float(getattr(contact, "bearing", 0) or 0) % 360.0
+    else:
+        speed_kts = float(visual_state.get("speed", ship_sim_speed_kts(contact)) or 0.0)
+        heading_deg = float(visual_state.get("bearing", getattr(contact, "bearing", 0)) or 0.0) % 360.0
+
+    data_array = (ctypes.c_double * 2)(float(max(0.0, speed_kts)), float(heading_deg))
+    definition = ensure_ship_motion_definition()
+    try:
+        result = sm.dll.SetDataOnSimObject(
+            sm.hSimConnect,
+            definition.value,
+            DWORD(int(object_id)),
+            0,
+            0,
+            ctypes.sizeof(data_array),
+            ctypes.cast(data_array, ctypes.c_void_p)
+        )
+        return sm.IsHR(result, 0)
+    except Exception as exc:
+        print(f"MSFS ship motion update failed: {exc}")
+        return False
+
+
+def heading_delta_deg(a, b):
+    return abs((float(a or 0.0) - float(b or 0.0) + 180.0) % 360.0 - 180.0)
+
+
+def should_send_injected_ship_motion(injection, visual_state, now):
+    last_motion_update = float(injection.get("last_motion_update", 0.0) or 0.0)
+    if last_motion_update <= 0.0:
+        return True
+    if now - last_motion_update >= ship_motion_resend_interval:
+        return True
+
+    speed = float(visual_state.get("speed", 0.0) or 0.0)
+    heading = float(visual_state.get("bearing", 0.0) or 0.0) % 360.0
+    last_speed = float(injection.get("last_speed", speed) or 0.0)
+    last_heading = float(injection.get("last_heading", heading) or 0.0) % 360.0
+
+    return (
+        abs(speed - last_speed) >= ship_motion_speed_epsilon_kts or
+        heading_delta_deg(heading, last_heading) >= ship_motion_heading_epsilon_deg
+    )
+
+
 def set_injected_ship_position(object_id, contact, visual_state=None):
     if not ensure_msfs_connection():
         return False
@@ -630,6 +1231,7 @@ def spawn_gaist_ship_for_contact(contact):
     pending_injection = {
         "request_id": request_id.value,
         "object_id": None,
+        "track_number": contact.track_number,
         "model_title": model_title,
         "spawn_requested_at": time.time(),
         "last_lat": contact.contact_lat,
@@ -638,7 +1240,6 @@ def spawn_gaist_ship_for_contact(contact):
         "last_speed": getattr(contact, "speed", 0),
         "last_position_update": 0,
         "last_waypoint_update": 0,
-        "last_resync": time.time(),
         "failed": False
     }
     ship_injections[contact.track_number] = pending_injection
@@ -675,8 +1276,10 @@ def spawn_gaist_ship_for_contact(contact):
         pending_injection["object_id"] = object_id
         now = time.time()
         visual_state = advance_ship_visual_state(pending_injection, contact, now)
-        if set_injected_ship_position(object_id, contact, visual_state):
-            pending_injection["last_position_update"] = now
+        if set_injected_ship_motion(object_id, contact, visual_state):
+            pending_injection["last_heading"] = visual_state["bearing"]
+            pending_injection["last_speed"] = visual_state["speed"]
+            pending_injection["last_motion_update"] = now
         return True
 
     pending_injection["failed"] = True
@@ -783,7 +1386,7 @@ def remove_all_injected_ships():
 
 def contact_is_msfs_ship_candidate(contact):
     return (
-        getattr(contact, "internal_type", "") in ("Surface-Ship", "Sub-surface") and
+        getattr(contact, "internal_type", "") == "Surface-Ship" and
         bool(gaist_model_title_for_contact(contact)) and
         not is_dicass_ping_contact(contact)
     )
@@ -794,9 +1397,10 @@ def update_msfs_ship_injections():
 
     if not ship_injection_enabled:
         return
-    if time.time() - ship_injection_last_update < ship_injection_update_interval:
+    now = time.time()
+    if ship_injection_update_interval > 0 and now - ship_injection_last_update < ship_injection_update_interval:
         return
-    ship_injection_last_update = time.time()
+    ship_injection_last_update = now
 
     if not ensure_msfs_connection():
         return
@@ -827,7 +1431,10 @@ def update_msfs_ship_injections():
                 object_id = int(assigned_object_id)
                 injection["object_id"] = object_id
                 visual_state = advance_ship_visual_state(injection, contact, now)
-                set_injected_ship_position(object_id, contact, visual_state)
+                if set_injected_ship_motion(object_id, contact, visual_state):
+                    injection["last_heading"] = visual_state["bearing"]
+                    injection["last_speed"] = visual_state["speed"]
+                    injection["last_motion_update"] = now
             elif now - injection.get("spawn_requested_at", now) >= 5.0:
                 injection["failed"] = True
                 injection["failure_reason"] = "no object id returned"
@@ -841,12 +1448,11 @@ def update_msfs_ship_injections():
 
         if object_id is not None:
             visual_state = advance_ship_visual_state(injection, contact, now)
-            if set_injected_ship_position(object_id, contact, visual_state):
-                injection["last_lat"] = visual_state["lat"]
-                injection["last_lon"] = visual_state["lon"]
-                injection["last_heading"] = visual_state["bearing"]
-                injection["last_speed"] = visual_state["speed"]
-                injection["last_position_update"] = now
+            if should_send_injected_ship_motion(injection, visual_state, now):
+                if set_injected_ship_motion(object_id, contact, visual_state):
+                    injection["last_heading"] = visual_state["bearing"]
+                    injection["last_speed"] = visual_state["speed"]
+                    injection["last_motion_update"] = now
 
 
     for track_number in list(ship_injections.keys()):
@@ -856,7 +1462,7 @@ def update_msfs_ship_injections():
 
 def contact_is_xplane_ship_candidate(contact):
     return (
-        getattr(contact, "internal_type", "") in ("Surface-Ship", "Sub-surface") and
+        getattr(contact, "internal_type", "") == "Surface-Ship" and
         bool(gaist_model_title_for_contact(contact)) and
         not is_dicass_ping_contact(contact)
     )
@@ -948,7 +1554,7 @@ def update_xplane_ship_injections():
     if not ship_injection_enabled or xplane != 1:
         return
     now = time.time()
-    if now - xplane_ship_last_export < xplane_ship_export_interval:
+    if xplane_ship_export_interval > 0 and now - xplane_ship_last_export < xplane_ship_export_interval:
         return
     xplane_ship_last_export = now
 
@@ -985,7 +1591,11 @@ try:
     pygame.scrap.init()
 except Exception:
     pass
-pygame.mixer.init()
+try:
+    pygame.mixer.init()
+except Exception:
+    if not DEDICATED_HOST_MODE:
+        raise
 
 
 submarine_longitude = None
@@ -1001,13 +1611,17 @@ SPECTROGRAM_UPDATE_INTERVAL_SEC = 0.08
 SPECTROGRAM_CHUNK_SECONDS = 0.36
 LISTEN_AUDIO_CHUNK_SECONDS = 0.08
 current_channel = None
-running_audio = True
-p = pyaudio.PyAudio()
-stream = p.open(format=pyaudio.paFloat32,
-            channels=1,
-            rate=fs,
-            output=True,
-            frames_per_buffer=CHUNK)
+running_audio = not DEDICATED_HOST_MODE
+if DEDICATED_HOST_MODE:
+    p = None
+    stream = None
+else:
+    p = pyaudio.PyAudio()
+    stream = p.open(format=pyaudio.paFloat32,
+                channels=1,
+                rate=fs,
+                output=True,
+                frames_per_buffer=CHUNK)
 listening_spectrogram_slot = None
 manual_azigram_bearing_lines = []
 last_listen_audio_time = 0.0
@@ -1152,13 +1766,13 @@ internal_contact_type_list = {
 
 # Panel to act as a visible border/frame
 contact_panel = pygame_gui.elements.UIPanel(
-    relative_rect=pygame.Rect((10, 10), (1900, 660)),  # slightly taller for contact name
+    relative_rect=pygame.Rect((10, 54), (1900, 560)),  # slightly taller for contact name
     manager=manager     # base layer, uses your panel theme
 )
 
 # Scrolling container inside the panel
 contact_define_container = pygame_gui.elements.UIScrollingContainer(
-    relative_rect=pygame.Rect((0, 0), (1900, 660)),  # fill the panel
+    relative_rect=pygame.Rect((0, 0), (1900, 560)),  # fill the panel
     manager=manager,
     container=contact_panel
 )
@@ -1166,7 +1780,7 @@ contact_define_container = pygame_gui.elements.UIScrollingContainer(
 
 def update_contact_define_scroll_area():
     if not contact_define_row_array:
-        contact_define_container.set_scrollable_area_dimensions((1880, 640))
+        contact_define_container.set_scrollable_area_dimensions((1880, 540))
         return
 
     max_right = 0
@@ -1177,7 +1791,7 @@ def update_contact_define_scroll_area():
 
     contact_define_container.set_scrollable_area_dimensions((
         max(1880, max_right + 40),
-        max(640, max_bottom + 40)
+        max(540, max_bottom + 40)
     ))
 
 
@@ -1261,12 +1875,17 @@ class ContactDefineRow:
         self.range_entered = False
         self.internal_type_entered = "Sub-surface"
         self.internal_class_entered = "Akula"
+        self.selected_model_library = MODEL_LIBRARY_AUTO
         self.selected_model = "Auto"
         self.class_entered = self.internal_class_entered
         self.speed_entered = False
         self.bearing_entered = False
         self.depth_entered = False
         self.broadcasting_entered = False
+        self.team_entered = "Neutral"
+        self.route_text_entered = ""
+        self.shadow_target_entered = ""
+        self.shadow_distance_nm_entered = 5.0
         self.saved = False
 
         # Layout constants
@@ -1298,7 +1917,7 @@ class ContactDefineRow:
 
         # Panel (auto-sized to fit everything)
         self.row_panel = pygame_gui.elements.UIPanel(
-            relative_rect=pygame.Rect((5, y), (440, 645)),
+            relative_rect=pygame.Rect((5, y), (440, 720)),
             manager=manager,
             container=container
         )
@@ -1360,6 +1979,22 @@ class ContactDefineRow:
             container=self.row_panel
         )
 
+        # Route
+        self.route_label, y_pos = add_section("Route")
+        self.route_textbox = pygame_gui.elements.UITextEntryLine(
+            relative_rect=pygame.Rect((X, y_pos), (WIDTH, INPUT_H)),
+            manager=manager,
+            container=self.row_panel
+        )
+
+        # Shadow target by contact name. Blank means independent movement.
+        self.shadow_target_label, y_pos = add_section("Shadow Target")
+        self.shadow_target_textbox = pygame_gui.elements.UITextEntryLine(
+            relative_rect=pygame.Rect((X, y_pos), (WIDTH, INPUT_H)),
+            manager=manager,
+            container=self.row_panel
+        )
+
         truth_y = 5
         self.internal_type_label = pygame_gui.elements.UITextBox(
             html_text="Type",
@@ -1389,15 +2024,44 @@ class ContactDefineRow:
         )
 
         truth_y += LABEL_H + GAP + INPUT_H + SECTION_GAP
+        self.model_library_label = pygame_gui.elements.UITextBox(
+            html_text="Library",
+            relative_rect=pygame.Rect((X2, truth_y), (WIDTH, LABEL_H)),
+            manager=manager,
+            container=self.row_panel
+        )
+        self.model_library_dropdown = make_contact_row_dropdown(
+            MODEL_LIBRARY_OPTIONS,
+            MODEL_LIBRARY_AUTO,
+            (X2, truth_y + LABEL_H + GAP),
+            self.row_panel
+        )
+
+        truth_y += LABEL_H + GAP + INPUT_H + SECTION_GAP
         self.model_label = pygame_gui.elements.UITextBox(
             html_text="Model",
             relative_rect=pygame.Rect((X2, truth_y), (WIDTH, LABEL_H)),
             manager=manager,
             container=self.row_panel
         )
+        self.model_dropdown_has_full_options = False
         self.model_dropdown = make_contact_row_dropdown(
-            model_options_for_contact("Sub-surface", "Akula"),
+            compact_model_options("Auto"),
             "Auto",
+            (X2, truth_y + LABEL_H + GAP),
+            self.row_panel
+        )
+
+        truth_y += LABEL_H + GAP + INPUT_H + SECTION_GAP
+        self.team_label = pygame_gui.elements.UITextBox(
+            html_text="Team",
+            relative_rect=pygame.Rect((X2, truth_y), (WIDTH, LABEL_H)),
+            manager=manager,
+            container=self.row_panel
+        )
+        self.team_dropdown = make_contact_row_dropdown(
+            CONTACT_TEAM_OPTIONS,
+            self.team_entered,
             (X2, truth_y + LABEL_H + GAP),
             self.row_panel
         )
@@ -1411,13 +2075,20 @@ class ContactDefineRow:
         )
         self.sync_broadcasting_checkbox()
 
-        # Button (placed after last section)
+        # Buttons (kept on the right so they stay inside the visible card area)
         self.define_contact_button = pygame_gui.elements.UIButton(
-            relative_rect=pygame.Rect((X, current_y), (WIDTH, 40)),
+            relative_rect=pygame.Rect((X2, truth_y + 44), (96, 40)),
             text="+",
             manager=manager,
             container=self.row_panel
         )
+        self.delete_contact_button = pygame_gui.elements.UIButton(
+            relative_rect=pygame.Rect((X2 + 104, truth_y + 44), (96, 40)),
+            text="DEL",
+            manager=manager,
+            container=self.row_panel
+        )
+
         self.sub_lat_textbox.set_allowed_characters(
             ['0','1','2','3','4','5','6','7','8','9','.','-']
         )
@@ -1438,6 +2109,15 @@ class ContactDefineRow:
         )
 
 
+    def is_route_enabled(self):
+        return self.internal_type_entered == "Surface-Ship"
+
+
+    def update_route_visibility(self):
+        self.route_label.show()
+        self.route_textbox.show()
+
+
     def sync_broadcasting_checkbox(self):
         new_colour = pygame.Color("#99C979") if self.broadcasting_entered else pygame.Color("#b13b3b")
         self.broadcasting_checkbox.set_text("BCAST ON" if self.broadcasting_entered else "BCAST OFF")
@@ -1452,27 +2132,84 @@ class ContactDefineRow:
         self.sync_broadcasting_checkbox()
 
 
-    def refresh_model_dropdown(self, selected_model=None):
-        options = model_options_for_contact(self.internal_type_entered, self.internal_class_entered)
+    def set_team(self, team):
+        if team not in CONTACT_TEAM_OPTIONS:
+            team = "Neutral"
+        self.team_entered = team
+        self.team_label.set_text('<font color="#99C979">Team</font>')
+        self.team_dropdown.kill()
+        self.team_dropdown = make_contact_row_dropdown(
+            CONTACT_TEAM_OPTIONS,
+            team,
+            (220, 349),
+            self.row_panel
+        )
+        self.update_route_visibility()
+
+    def refresh_model_library_dropdown(self):
+        self.model_library_label.set_text(
+            '<font color="#99C979">Library</font>' if self.selected_model_library != MODEL_LIBRARY_AUTO else "Library"
+        )
+        self.model_library_dropdown.kill()
+        self.model_library_dropdown = make_contact_row_dropdown(
+            MODEL_LIBRARY_OPTIONS,
+            self.selected_model_library,
+            (220, 193),
+            self.row_panel
+        )
+
+    def set_model_library(self, model_library, selected_model=None, full_model_options=True):
+        self.selected_model_library = normalize_model_library(model_library)
+        self.refresh_model_library_dropdown()
+        self.refresh_model_dropdown(self.selected_model if selected_model is None else selected_model, full_options=full_model_options)
+
+    def refresh_model_dropdown(self, selected_model=None, full_options=True):
         selected_model = selected_model if selected_model is not None else self.selected_model
-        if selected_model not in options:
-            selected_model = "Auto"
+        if full_options:
+            options = model_options_for_contact(
+                self.internal_type_entered,
+                self.internal_class_entered,
+                self.selected_model_library
+            )
+            if selected_model not in options:
+                selected_model = "Auto"
+        else:
+            options = compact_model_options(selected_model)
         self.selected_model = selected_model
+        self.model_dropdown_has_full_options = bool(full_options)
         self.model_label.set_text('<font color="#99C979">Model</font>' if selected_model != "Auto" else "Model")
         self.model_dropdown.kill()
         self.model_dropdown = make_contact_row_dropdown(
             options,
             selected_model,
-            (220, 193),
+            (220, 271),
             self.row_panel
         )
+
+
+    def ensure_full_model_dropdown(self):
+        if getattr(self, "model_dropdown_has_full_options", False):
+            return
+        selected_model = self.selected_model
+        options = model_options_for_contact(
+            self.internal_type_entered,
+            self.internal_class_entered,
+            self.selected_model_library
+        )
+        if selected_model not in options:
+            options.append(selected_model)
+        existing = set(compact_model_options(selected_model))
+        additional_options = [option for option in options if option not in existing]
+        if additional_options:
+            self.model_dropdown.add_options(additional_options)
+        self.model_dropdown_has_full_options = True
 
 
     def set_model(self, model_title):
         self.refresh_model_dropdown(model_title)
 
 
-    def set_internal_type(self, internal_type, internal_class=None, selected_model=None):
+    def set_internal_type(self, internal_type, internal_class=None, selected_model=None, refresh_model=True):
         if selected_model is None:
             selected_model = "Auto"
         if internal_type not in internal_contact_type_list:
@@ -1504,11 +2241,13 @@ class ContactDefineRow:
         )
 
         self.class_entered = internal_class if internal_type == "Sub-surface" else ""
-        self.refresh_model_dropdown(selected_model)
+        if refresh_model:
+            self.refresh_model_dropdown(selected_model, full_options=True)
         if internal_type == "Surface-Ship":
             self.set_broadcasting(True)
         elif internal_type != "Surface-Ship":
             self.set_broadcasting(False)
+        self.update_route_visibility()
 
 
     def update_from_textboxes(self):
@@ -1581,79 +2320,114 @@ class ContactDefineRow:
         except:
             self.sub_bearing_textbox.set_text("")
 
+        self.route_text_entered = self.route_textbox.get_text().strip()
+        self.shadow_target_entered = self.shadow_target_textbox.get_text().strip()
+
 
 
 
 # Main buttons outside the panel
 start_button = pygame_gui.elements.UIButton(
-    relative_rect=pygame.Rect((656, 675), (627, 30)),
+    relative_rect=pygame.Rect((656, 625), (627, 30)),
     text="START",
     manager=manager
 )
 save_button = pygame_gui.elements.UIButton(
-    relative_rect=pygame.Rect((10, 675), (313, 30)),
+    relative_rect=pygame.Rect((10, 625), (313, 30)),
     text="SAVE",
     manager=manager
 )
 load_button = pygame_gui.elements.UIButton(
-    relative_rect=pygame.Rect((333, 675), (313, 30)),
+    relative_rect=pygame.Rect((333, 625), (313, 30)),
     text="LOAD",
     manager=manager
 )
 simulator_button = pygame_gui.elements.UIButton(
-    relative_rect=pygame.Rect((1293, 675), (617, 30)),
+    relative_rect=pygame.Rect((1293, 625), (617, 30)),
     text="X-Plane",
     manager=manager
 )
 civilian_traffic_button = pygame_gui.elements.UIButton(
-    relative_rect=pygame.Rect((10, 715), (313, 30)),
+    relative_rect=pygame.Rect((10, 665), (220, 30)),
     text="ADD CIV TRAFFIC",
     manager=manager
 )
 whale_traffic_button = pygame_gui.elements.UIButton(
-    relative_rect=pygame.Rect((10, 795), (313, 30)),
+    relative_rect=pygame.Rect((240, 665), (220, 30)),
     text="ADD WHALES",
     manager=manager
 )
 civilian_lat_label = pygame_gui.elements.UILabel(
-    relative_rect=pygame.Rect((10, 755), (58, 24)),
+    relative_rect=pygame.Rect((480, 668), (58, 24)),
     text="CIV LAT",
     manager=manager
 )
 civilian_lat_entry = pygame_gui.elements.UITextEntryLine(
-    relative_rect=pygame.Rect((72, 755), (112, 28)),
+    relative_rect=pygame.Rect((542, 665), (112, 30)),
     manager=manager
 )
 civilian_lon_label = pygame_gui.elements.UILabel(
-    relative_rect=pygame.Rect((194, 755), (58, 24)),
+    relative_rect=pygame.Rect((664, 668), (58, 24)),
     text="CIV LON",
     manager=manager
 )
 civilian_lon_entry = pygame_gui.elements.UITextEntryLine(
-    relative_rect=pygame.Rect((256, 755), (112, 28)),
+    relative_rect=pygame.Rect((726, 665), (112, 30)),
     manager=manager
 )
 civilian_lat_entry.set_allowed_characters(['0','1','2','3','4','5','6','7','8','9','.','-'])
 civilian_lon_entry.set_allowed_characters(['0','1','2','3','4','5','6','7','8','9','.','-'])
 multiplayer_role_dropdown = pygame_gui.elements.UIDropDownMenu(
-    options_list=["OFF", "HOST", "JOIN"],
+    options_list=["OFF", "SERVER", "HOST", "JOIN"],
     starting_option="OFF",
-    relative_rect=pygame.Rect((333, 715), (150, 30)),
+    relative_rect=pygame.Rect((10, 705), (150, 30)),
     manager=manager
 )
 multiplayer_callsign_entry = pygame_gui.elements.UITextEntryLine(
-    relative_rect=pygame.Rect((493, 715), (210, 30)),
+    relative_rect=pygame.Rect((170, 705), (210, 30)),
     manager=manager
 )
 multiplayer_callsign_entry.set_text(MULTIPLAYER_CALLSIGN)
-multiplayer_aircraft_dropdown = pygame_gui.elements.UIDropDownMenu(
+multiplayer_aircraft_dropdown = force_dropdown_down(pygame_gui.elements.UIDropDownMenu(
     options_list=MULTIPLAYER_AIRCRAFT_TYPES,
     starting_option=MULTIPLAYER_AIRCRAFT_TYPE,
-    relative_rect=pygame.Rect((713, 715), (210, 30)),
+    relative_rect=pygame.Rect((390, 705), (300, 30)),
+    manager=manager
+))
+multiplayer_player_type_dropdown = pygame_gui.elements.UIDropDownMenu(
+    options_list=MULTIPLAYER_PLAYER_TYPES,
+    starting_option=MULTIPLAYER_PLAYER_TYPE,
+    relative_rect=pygame.Rect((700, 705), (150, 30)),
     manager=manager
 )
+multiplayer_team_dropdown = pygame_gui.elements.UIDropDownMenu(
+    options_list=MULTIPLAYER_TEAMS,
+    starting_option=MULTIPLAYER_TEAM,
+    relative_rect=pygame.Rect((860, 705), (150, 30)),
+    manager=manager
+)
+multiplayer_password_label = pygame_gui.elements.UILabel(
+    relative_rect=pygame.Rect((10, 745), (150, 24)),
+    text="CONTACT PW",
+    manager=manager
+)
+multiplayer_password_entry = pygame_gui.elements.UITextEntryLine(
+    relative_rect=pygame.Rect((170, 745), (210, 30)),
+    manager=manager
+)
+try:
+    multiplayer_password_entry.set_text_hidden(True)
+except AttributeError:
+    pass
+multiplayer_contact_dropdown = force_dropdown_down(pygame_gui.elements.UIDropDownMenu(
+    options_list=ownship_control_contact_options,
+    starting_option="Auto",
+    relative_rect=pygame.Rect((390, 705), (300, 30)),
+    manager=manager
+))
+multiplayer_contact_dropdown.hide()
 multiplayer_status_label = pygame_gui.elements.UILabel(
-    relative_rect=pygame.Rect((933, 715), (520, 30)),
+    relative_rect=pygame.Rect((1020, 705), (873, 30)),
     text="MP OFF",
     manager=manager
 )
@@ -1672,6 +2446,11 @@ register_ui_element(civilian_lon_entry, civilian_lon_entry.relative_rect)
 register_ui_element(multiplayer_role_dropdown, multiplayer_role_dropdown.relative_rect)
 register_ui_element(multiplayer_callsign_entry, multiplayer_callsign_entry.relative_rect)
 register_ui_element(multiplayer_aircraft_dropdown, multiplayer_aircraft_dropdown.relative_rect)
+register_ui_element(multiplayer_player_type_dropdown, multiplayer_player_type_dropdown.relative_rect)
+register_ui_element(multiplayer_team_dropdown, multiplayer_team_dropdown.relative_rect)
+register_ui_element(multiplayer_password_label, multiplayer_password_label.relative_rect)
+register_ui_element(multiplayer_password_entry, multiplayer_password_entry.relative_rect)
+register_ui_element(multiplayer_contact_dropdown, multiplayer_contact_dropdown.relative_rect)
 register_ui_element(multiplayer_status_label, multiplayer_status_label.relative_rect)
 
 def internal_rect_to_screen_rect(base_rect):
@@ -1708,6 +2487,7 @@ def layout_top_mode_buttons(window_width, window_height):
     top_buttons = (
         (map_mode_button, mode_width),
         (radar_mode_button, mode_width),
+        (nav_mode_button, mode_width),
         (radar_orientation_button, orientation_width),
         (radar_range_button, range_width),
         (bearing_lines_button, lines_width),
@@ -1721,6 +2501,68 @@ def layout_top_mode_buttons(window_width, window_height):
         button.set_dimensions((rect.w, rect.h))
         x += width + gap
 
+
+
+def sync_slot_range_circle_button_style(slot):
+    if not hasattr(slot, "toggle_range_circle_button"):
+        return
+    range_circle = False
+    if is_numeric_channel(getattr(slot, "selected", None)):
+        selected_channel = int(slot.selected)
+        for sono in globals().get("sono_array", []):
+            if int(getattr(sono, "channel", -1)) == selected_channel:
+                range_circle = getattr(sono, "range_circle", False)
+                break
+    new_colour = pygame.Color("#99C979") if range_circle else pygame.Color("#b13b3b")
+    slot.toggle_range_circle_button.colours["normal_bg"] = new_colour
+    slot.toggle_range_circle_button.colours["hovered_bg"] = new_colour
+    slot.toggle_range_circle_button.colours["active_bg"] = new_colour
+    slot.toggle_range_circle_button.rebuild()
+
+
+def sync_stateful_button_styles():
+    """Reapply runtime button colours after pygame_gui rebuilds on resize."""
+    for function_name in (
+        "sync_bearing_lines_button_style",
+        "sync_arm_button_style",
+        "sync_auto_buoy_button_style",
+        "sync_ship_inject_button_style",
+        "sync_torpedo_designate_button_style",
+        "sync_contact_lines_button_style",
+    ):
+        sync_function = globals().get(function_name)
+        if sync_function is not None:
+            sync_function()
+
+    if globals().get("selected_contact") is not None and "sync_ship_command_controls" in globals():
+        sync_ship_command_controls()
+
+    for row in globals().get("contact_define_row_array", []):
+        if hasattr(row, "sync_broadcasting_checkbox"):
+            row.sync_broadcasting_checkbox()
+
+    for slot in globals().get("spectrogram_slot_array", []):
+        sync_slot_range_circle_button_style(slot)
+        for method_name in (
+            "sync_difar_display_button_style",
+            "sync_band_mode_button_style",
+            "sync_bearing_lines_button_style",
+            "sync_listen_button_style",
+        ):
+            sync_method = getattr(slot, method_name, None)
+            if sync_method is not None:
+                sync_method()
+
+
+def sync_display_mode_control_visibility():
+    if "in_menu" in globals() and in_menu:
+        return
+    radar_controls_visible = display_mode == "RADAR"
+    for element in (radar_orientation_button, radar_range_button):
+        if radar_controls_visible:
+            element.show()
+        else:
+            element.hide()
 
 def scale_rect(base_rect, screen, base_width=1920, base_height=1080):
     """
@@ -2118,7 +2960,7 @@ def sync_settings_fields():
     settings_simulator_dropdown.selected_option = "X-Plane" if xplane == 1 else "MSFS"
     settings_callsign_entry.set_text(MULTIPLAYER_CALLSIGN)
     settings_version_label.set_text(f"v{APP_VERSION}")
-    settings_status_label.set_text(f"{MULTIPLAYER_CALLSIGN} {MULTIPLAYER_AIRCRAFT_TYPE}")
+    settings_status_label.set_text(f"{MULTIPLAYER_CALLSIGN} {multiplayer_platform_label()}")
 
 
 def apply_sound_level(option):
@@ -2127,7 +2969,7 @@ def apply_sound_level(option):
         master_sound_level = max(0.0, min(1.0, float(str(option).replace("%", "")) / 100.0))
     except ValueError:
         master_sound_level = 1.0
-    if "launch_sound" in globals():
+    if "launch_sound" in globals() and launch_sound is not None:
         launch_sound.set_volume(master_sound_level)
 
 
@@ -2141,6 +2983,7 @@ def apply_resolution_option(option):
     refresh_resolution_dependent_fonts()
     resize_ui(screen_width, screen_height)
     layout_top_mode_buttons(screen_width, screen_height)
+    sync_stateful_button_styles()
     radar_terrain_cache["key"] = None
 
 
@@ -2183,17 +3026,141 @@ last_xplane_data = None
 # Global list to hold all rows
 contact_define_row_array = []
 
+
+def reflow_contact_define_rows():
+    x = 5
+    for row in contact_define_row_array:
+        row.row_panel.set_relative_position((x, 10))
+        x = row.row_panel.rect.right + 10
+    update_contact_define_scroll_area()
+
+
+def ensure_contact_define_row_exists():
+    if not contact_define_row_array:
+        row = ContactDefineRow(10, manager, contact_define_container)
+        contact_define_row_array.append(row)
+        update_contact_define_scroll_area()
+
+
+def row_contact_name(row):
+    try:
+        row.update_from_textboxes()
+    except Exception:
+        pass
+    return str(getattr(row, "name_entered", "") or row.contact_name_textbox.get_text() or "").strip()
+
+
+def delete_contact_define_row(row, delete_live=True):
+    if row not in contact_define_row_array:
+        return False
+    contact_name = row_contact_name(row)
+    if delete_live and contact_name:
+        for contact in list(contacts):
+            if str(getattr(contact, "name", "")) == contact_name:
+                delete_contact(contact, delete_rows=False)
+    row.row_panel.kill()
+    contact_define_row_array.remove(row)
+    ensure_contact_define_row_exists()
+    reflow_contact_define_rows()
+    return True
+
+
+def delete_matching_contact_rows(contact):
+    contact_name = str(getattr(contact, "name", "") or "").strip()
+    if not contact_name:
+        return 0
+    removed = 0
+    for row in list(contact_define_row_array):
+        if row_contact_name(row) == contact_name:
+            row.row_panel.kill()
+            contact_define_row_array.remove(row)
+            removed += 1
+    ensure_contact_define_row_exists()
+    reflow_contact_define_rows()
+    return removed
+
+
+def hide_contact_context_controls():
+    contact_context_panel.hide()
+    torpedo_designate_button.hide()
+    contact_lines_button.hide()
+    hide_ship_command_controls()
+    contact_delete_button.hide()
+    contact_context_close_button.hide()
+    contact_type_dropdown.hide()
+    contact_class_dropdown.hide()
+    contact_status_dropdown.hide()
+    contact_country_dropdown.hide()
+
+
+def delete_contact(contact, delete_rows=True):
+    global selected_contact, torpedo_designated_contact, multiplayer_last_state_broadcast
+    if contact is None:
+        return False
+    track_number = getattr(contact, "track_number", None)
+    if track_number is not None:
+        remove_injected_ship(track_number)
+    if torpedo_designated_contact is contact:
+        torpedo_designated_contact = None
+    for torpedo in torp_array:
+        if getattr(torpedo, "target", None) is contact:
+            torpedo.target = None
+    if contact in contacts:
+        contacts.remove(contact)
+    if delete_rows:
+        delete_matching_contact_rows(contact)
+    if selected_contact is contact:
+        selected_contact = None
+        hide_contact_context_controls()
+    multiplayer_last_state_broadcast = 0.0
+    print(f"Deleted contact {getattr(contact, 'name', 'Contact')} track {track_number if track_number is not None else '?'}")
+    return True
+
+
 def draw_menu():
     # Fill menu background
     menu_surface.fill((5,5,10))
 
     global contact_define_row_array
+    refresh_control_contact_dropdown()
+    update_multiplayer_platform_selector_visibility()
 
     # If no rows exist, create the first one
     if not contact_define_row_array:
         first_row = ContactDefineRow(10, manager, contact_define_container)
         contact_define_row_array.append(first_row)
         update_contact_define_scroll_area()
+
+
+def draw_start_loading_progress(progress, status_text="Loading simulation"):
+    pygame.event.pump()
+    progress = max(0.0, min(1.0, float(progress or 0.0)))
+    pygame.mouse.set_visible(progress >= 1.0)
+
+    screen.fill((4, 8, 12))
+
+    panel_width = min(max(360, int(screen_width * 0.42)), screen_width - 80)
+    panel_height = 126
+    panel_rect = pygame.Rect(0, 0, panel_width, panel_height)
+    panel_rect.center = (screen_width // 2, screen_height // 2)
+    pygame.draw.rect(screen, (12, 18, 24), panel_rect, border_radius=8)
+    pygame.draw.rect(screen, (70, 92, 110), panel_rect, width=1, border_radius=8)
+
+    title_font = scaled_sys_font(22, bold=True)
+    label_font = scaled_sys_font(13)
+    title_surface = title_font.render("LOADING SIMULATION", True, (232, 242, 245))
+    status_surface = label_font.render(str(status_text), True, (170, 190, 198))
+    screen.blit(title_surface, (panel_rect.x + 24, panel_rect.y + 20))
+    screen.blit(status_surface, (panel_rect.x + 24, panel_rect.y + 50))
+
+    bar_rect = pygame.Rect(panel_rect.x + 24, panel_rect.y + 82, panel_rect.w - 48, 16)
+    fill_rect = bar_rect.copy()
+    fill_rect.width = max(4, int(bar_rect.width * progress))
+    pygame.draw.rect(screen, (34, 44, 52), bar_rect, border_radius=4)
+    pygame.draw.rect(screen, (92, 205, 132), fill_rect, border_radius=4)
+    pygame.draw.rect(screen, (95, 118, 130), bar_rect, width=1, border_radius=4)
+
+    pygame.display.update()
 
 
 def set_menu_visible(visible):
@@ -2213,10 +3180,16 @@ def set_menu_visible(visible):
         civilian_lon_entry.show()
         multiplayer_role_dropdown.show()
         multiplayer_callsign_entry.show()
-        multiplayer_aircraft_dropdown.show()
+        multiplayer_player_type_dropdown.show()
+        multiplayer_team_dropdown.show()
+        multiplayer_password_label.show()
+        multiplayer_password_entry.show()
+        refresh_control_contact_dropdown()
+        update_multiplayer_platform_selector_visibility()
         multiplayer_status_label.show()
         map_mode_button.hide()
         radar_mode_button.hide()
+        nav_mode_button.hide()
         radar_orientation_button.hide()
         radar_range_button.hide()
         ship_inject_button.hide()
@@ -2231,6 +3204,9 @@ def set_menu_visible(visible):
         if "xbt_panel_select_dropdown" in globals() and xbt_panel_select_dropdown is not None:
             xbt_panel_select_dropdown.hide()
         contact_context_panel.hide()
+        if "nav_elements" in globals():
+            for element in nav_elements:
+                element.hide()
         if "torpedo_designate_button" in globals():
             torpedo_designate_button.hide()
         if "contact_context_close_button" in globals():
@@ -2259,11 +3235,16 @@ def set_menu_visible(visible):
         multiplayer_role_dropdown.hide()
         multiplayer_callsign_entry.hide()
         multiplayer_aircraft_dropdown.hide()
+        multiplayer_player_type_dropdown.hide()
+        multiplayer_team_dropdown.hide()
+        multiplayer_password_label.hide()
+        multiplayer_password_entry.hide()
+        multiplayer_contact_dropdown.hide()
         multiplayer_status_label.hide()
         map_mode_button.show()
         radar_mode_button.show()
-        radar_orientation_button.show()
-        radar_range_button.show()
+        nav_mode_button.show()
+        sync_display_mode_control_visibility()
         ship_inject_button.show()
         if "xbt_tab_button" in globals():
             xbt_tab_button.show()
@@ -2272,15 +3253,28 @@ def set_menu_visible(visible):
         row.row_panel.show() if visible else row.row_panel.hide()
 
 
-def start_game():
-    global lat, long, alt, sub_x, sub_y, sm, aq
+def start_game(progress_callback=None):
+    global lat, long, alt, sub_x, sub_y, sm, aq, hdg
+
+    if progress_callback is None:
+        progress_callback = lambda _progress, _status: None
 
     submarine_latitude = 50
     submarine_longitude = 0
 
-    
+    progress_callback(0.46, "Positioning player")
+
+    if player_is_ship_or_sub():
+        controlled = selected_ownship_control_contact()
+        if controlled is not None:
+            lat = float(controlled.contact_lat)
+            long = float(controlled.contact_long)
+            hdg = float(getattr(controlled, "bearing", hdg) or hdg)
+            alt = -float(getattr(controlled, "depth", 0.0) or 0.0) if player_is_submarine() else 0.0
+        return
 
     if xplane == 1:
+        progress_callback(0.62, "Reading aircraft position")
         json_path = r"aircraft_position.json"
         with open(json_path, "r") as f:
             data = json.load(f)
@@ -2290,6 +3284,7 @@ def start_game():
         alt = data["altitude_ft"] 
 
     else:
+        progress_callback(0.62, "Connecting to simulator")
         try:
             sm = SimConnect()
             aq = AircraftRequests(sm, _time=2000)
@@ -2310,7 +3305,9 @@ def start_game():
             long = None
             alt = None
 
+    progress_callback(0.82, "Preparing traffic")
     ensure_random_whales()
+    progress_callback(0.92, "Finalizing display")
 
 
 
@@ -2384,8 +3381,22 @@ last_mouse = (0, 0)
 
 
 
-launch_sound = pygame.mixer.Sound("assets/launch_sound.wav")
-launch_sound.set_volume(master_sound_level)
+launch_sound = None
+if not DEDICATED_HOST_MODE and pygame.mixer.get_init():
+    try:
+        launch_sound = pygame.mixer.Sound("assets/launch_sound.wav")
+        launch_sound.set_volume(master_sound_level)
+    except pygame.error as exc:
+        print(f"[AUDIO] Launch sound disabled: {exc}")
+
+
+def play_launch_sound():
+    if launch_sound is None:
+        return
+    try:
+        launch_sound.play()
+    except pygame.error as exc:
+        print(f"[AUDIO] Launch sound failed: {exc}")
 
 thermocline_depth = 1000
 seabed_depth = 2600
@@ -2753,10 +3764,114 @@ def create_land_raster(polygons, size=LAND_RASTER_SIZE):
 
 
 coastline_polylines = load_coastline_polylines()
-land_polygons = []
+land_polygons = load_land_polygons()
 coastline_index = build_terrain_index(coastline_polylines)
-land_index = {}
-land_raster_surface = None
+land_index = build_terrain_index(land_polygons)
+land_raster_surface = create_land_raster(land_polygons)
+
+
+def point_in_polygon_latlon(lat_value, lon_value, polygon_points):
+    inside = False
+    count = len(polygon_points)
+    if count < 3:
+        return False
+    j = count - 1
+    for i in range(count):
+        lat_i, lon_i = polygon_points[i]
+        lat_j, lon_j = polygon_points[j]
+        crosses = ((lat_i > lat_value) != (lat_j > lat_value))
+        if crosses:
+            lon_cross = (lon_j - lon_i) * (lat_value - lat_i) / ((lat_j - lat_i) or 1e-12) + lon_i
+            if lon_value < lon_cross:
+                inside = not inside
+        j = i
+    return inside
+
+
+def point_is_land(lat_value, lon_value):
+    for polygon in query_terrain_index(land_index, lat_value, lon_value, 1.0):
+        min_lat, max_lat, min_lon, max_lon = polygon["bounds"]
+        if not (min_lat <= lat_value <= max_lat and min_lon <= lon_value <= max_lon):
+            continue
+        if point_in_polygon_latlon(lat_value, lon_value, polygon["points"]):
+            return True
+    return False
+
+
+def point_to_segment_distance_nm(lat_value, lon_value, start_point, end_point):
+    ref_lat_rad = math.radians(lat_value)
+
+    def to_xy(point):
+        point_lat, point_lon = point
+        return (
+            (point_lon - lon_value) * 60.0 * max(0.05, math.cos(ref_lat_rad)),
+            (point_lat - lat_value) * 60.0
+        )
+
+    ax, ay = to_xy(start_point)
+    bx, by = to_xy(end_point)
+    abx = bx - ax
+    aby = by - ay
+    denom = abx * abx + aby * aby
+    if denom <= 1e-9:
+        return math.hypot(ax, ay)
+    t = max(0.0, min(1.0, -(ax * abx + ay * aby) / denom))
+    closest_x = ax + abx * t
+    closest_y = ay + aby * t
+    return math.hypot(closest_x, closest_y)
+
+
+def distance_to_nearest_coast_nm(lat_value, lon_value, search_nm=25.0):
+    nearest = None
+    for coastline in query_terrain_index(coastline_index, lat_value, lon_value, search_nm):
+        points = coastline.get("points", [])
+        for index in range(len(points) - 1):
+            distance_nm = point_to_segment_distance_nm(lat_value, lon_value, points[index], points[index + 1])
+            if nearest is None or distance_nm < nearest:
+                nearest = distance_nm
+    return nearest
+
+
+def random_sea_point_near(origin_lat, origin_lon, min_range_nm=CIVILIAN_TRAFFIC_MIN_RANGE_NM, max_range_nm=CIVILIAN_TRAFFIC_MAX_RANGE_NM, min_offshore_nm=CIVILIAN_TRAFFIC_MIN_OFFSHORE_NM, attempts=160):
+    fallback = None
+    for _ in range(attempts):
+        spawn_bearing = random.uniform(0, 360)
+        spawn_range_nm = random.uniform(min_range_nm, max_range_nm)
+        candidate_lat, candidate_lon = destination_from_bearing(origin_lat, origin_lon, spawn_bearing, spawn_range_nm)
+        if point_is_land(candidate_lat, candidate_lon):
+            continue
+        coast_distance_nm = distance_to_nearest_coast_nm(candidate_lat, candidate_lon, max(min_offshore_nm + 8.0, 18.0))
+        if coast_distance_nm is None:
+            return candidate_lat, candidate_lon, spawn_range_nm, spawn_bearing
+        if fallback is None:
+            fallback = (candidate_lat, candidate_lon, spawn_range_nm, spawn_bearing)
+        if coast_distance_nm >= min_offshore_nm:
+            return candidate_lat, candidate_lon, spawn_range_nm, spawn_bearing
+    return fallback
+
+
+def random_global_latlon(lat_limit=CIVILIAN_TRAFFIC_GLOBAL_LAT_LIMIT):
+    min_sin = math.sin(math.radians(-lat_limit))
+    max_sin = math.sin(math.radians(lat_limit))
+    lat_value = math.degrees(math.asin(random.uniform(min_sin, max_sin)))
+    lon_value = random.uniform(-180.0, 180.0)
+    return lat_value, lon_value
+
+
+def random_global_sea_point(min_offshore_nm=CIVILIAN_TRAFFIC_MIN_OFFSHORE_NM, attempts=260):
+    fallback = None
+    for _ in range(attempts):
+        candidate_lat, candidate_lon = random_global_latlon()
+        if point_is_land(candidate_lat, candidate_lon):
+            continue
+        coast_distance_nm = distance_to_nearest_coast_nm(candidate_lat, candidate_lon, max(min_offshore_nm + 8.0, 18.0))
+        if coast_distance_nm is None:
+            return candidate_lat, candidate_lon, None, random.uniform(0, 360)
+        if fallback is None:
+            fallback = (candidate_lat, candidate_lon, None, random.uniform(0, 360))
+        if coast_distance_nm >= min_offshore_nm:
+            return candidate_lat, candidate_lon, None, random.uniform(0, 360)
+    return fallback
 #menu buttons
 
 
@@ -3099,8 +4214,8 @@ auto_buoy_button = pygame_gui.elements.UIButton(
     tool_tip_text="Toggle auto buoy drops from the active search pattern."
 )
 auto_buoy_status_label = pygame_gui.elements.UILabel(
-    relative_rect=pygame.Rect((720, 54), (210, 14)),
-    text="AUTO OFF",
+    relative_rect=pygame.Rect((824, 31), (96, 20)),
+    text="OFF",
     manager=manager,
     container=controls_panel
 )
@@ -3123,9 +4238,9 @@ def sync_auto_buoy_button_style():
     auto_buoy_button.rebuild()
     remaining = sum(1 for drop in auto_buoy_pending_drops if not drop.get("dropped"))
     if auto_buoy_enabled:
-        auto_buoy_status_label.set_text(f"AUTO {remaining} @ {auto_buoy_trigger_nm:.1f}NM")
+        auto_buoy_status_label.set_text(f"{remaining} @ {auto_buoy_trigger_nm:.1f}NM")
     else:
-        auto_buoy_status_label.set_text("AUTO OFF")
+        auto_buoy_status_label.set_text("OFF")
 
 
 def sync_ship_inject_button_style():
@@ -3138,35 +4253,193 @@ def sync_ship_inject_button_style():
     ship_inject_button.rebuild()
 
 
+def multiplayer_is_host_role(role=None):
+    return (role or multiplayer_role) in ("HOST", "SERVER")
+
+
+def multiplayer_contact_password_ok(password=None):
+    candidate = multiplayer_contact_password if password is None else password
+    return str(candidate or "") == MULTIPLAYER_CONTACT_PASSWORD
+
+
+def multiplayer_host_requires_password():
+    return bool(multiplayer_host_seen and multiplayer_host_seen.get("password_required"))
+
+
+def multiplayer_can_join_server():
+    return True
+
 def sanitize_multiplayer_callsign(text):
-    clean = re.sub(r"[^A-Za-z0-9_-]", "", text.strip().upper())
+    clean = re.sub(r"[^A-Za-z0-9_-]", "", str(text or "").strip().upper())
     return (clean or "AIRCRAFT")[:12]
 
 
+def dropdown_value(value):
+    if isinstance(value, (list, tuple)) and value:
+        return str(value[0])
+    return str(value)
+
+
+def set_registered_ui_base_rect(element, base_rect):
+    for index, (registered, _) in enumerate(ui_elements):
+        if registered is element:
+            ui_elements[index] = (registered, base_rect.copy())
+            break
+    else:
+        register_ui_element(element, base_rect.copy())
+    scaled_rect = internal_rect_to_screen_rect(base_rect)
+    element.set_relative_position((scaled_rect.x, scaled_rect.y))
+    element.set_dimensions((scaled_rect.w, scaled_rect.h))
+
+
+def multiplayer_platform_selector_rect():
+    return pygame.Rect((390, 705), (300, 30))
+
+
+def control_contact_allowed(contact, player_type=None):
+    player_type = dropdown_value(player_type or MULTIPLAYER_PLAYER_TYPE)
+    internal_type = getattr(contact, "internal_type", "")
+    if player_type == "Ship":
+        return internal_type == "Surface-Ship"
+    if player_type == "Submarine":
+        return internal_type == "Sub-surface"
+    return False
+
+
+def control_contact_label(contact):
+    return f"{int(getattr(contact, 'track_number', 0) or 0):04d} {getattr(contact, 'name', 'Contact')} {getattr(contact, 'internal_class', '')}".strip()
+
+
+def control_contact_options_for_type(player_type=None):
+    options = ["Auto"]
+    if "contacts" not in globals():
+        return options
+    for contact in contacts:
+        if control_contact_allowed(contact, player_type):
+            label = control_contact_label(contact)
+            if label not in options:
+                options.append(label)
+    return options
+
+
+def selected_control_contact_track_from_label(label):
+    match = re.match(r"(\d+)", dropdown_value(label).strip())
+    return int(match.group(1)) if match else None
+
+
+def refresh_control_contact_dropdown(selected=None):
+    global multiplayer_contact_dropdown, ownship_control_contact_key, ownship_control_contact_options
+    if "multiplayer_contact_dropdown" not in globals():
+        return
+    selected = dropdown_value(selected if selected is not None else ownship_control_contact_key)
+    options = control_contact_options_for_type()
+    selected_track = selected_control_contact_track_from_label(selected)
+    if selected not in options and selected_track is None:
+        selected_track = ownship_control_contact_track
+    if selected not in options and selected_track is not None:
+        track_prefix = f"{int(selected_track):04d} "
+        selected = next((option for option in options if option.startswith(track_prefix)), selected)
+    if selected not in options:
+        selected = "Auto"
+    current_selected = dropdown_value(getattr(multiplayer_contact_dropdown, "selected_option", selected))
+    if options == ownship_control_contact_options and current_selected == selected:
+        return
+    visible = getattr(multiplayer_contact_dropdown, "visible", False)
+    base_rect = multiplayer_platform_selector_rect()
+    rect = internal_rect_to_screen_rect(base_rect)
+    ui_elements[:] = [item for item in ui_elements if item[0] is not multiplayer_contact_dropdown]
+    multiplayer_contact_dropdown.kill()
+    ownship_control_contact_options = options
+    ownship_control_contact_key = selected
+    multiplayer_contact_dropdown = force_dropdown_down(pygame_gui.elements.UIDropDownMenu(
+        options_list=options,
+        starting_option=selected,
+        relative_rect=rect,
+        manager=manager
+    ))
+    register_ui_element(multiplayer_contact_dropdown, base_rect)
+    if visible:
+        multiplayer_contact_dropdown.show()
+    else:
+        multiplayer_contact_dropdown.hide()
+
+
+def update_multiplayer_platform_selector_visibility():
+    menu_visible = bool(getattr(contact_panel, "visible", False))
+    set_registered_ui_base_rect(multiplayer_aircraft_dropdown, multiplayer_platform_selector_rect())
+    set_registered_ui_base_rect(multiplayer_contact_dropdown, multiplayer_platform_selector_rect())
+    if player_is_ship_or_sub():
+        multiplayer_aircraft_dropdown.hide()
+        if menu_visible:
+            multiplayer_contact_dropdown.show()
+        else:
+            multiplayer_contact_dropdown.hide()
+    else:
+        multiplayer_contact_dropdown.hide()
+        if menu_visible:
+            multiplayer_aircraft_dropdown.show()
+        else:
+            multiplayer_aircraft_dropdown.hide()
+
+
+def selected_ownship_control_contact():
+    global ownship_control_contact_track, ownship_control_contact_key
+    if "contacts" not in globals() or not player_is_ship_or_sub():
+        return None
+    selected_track = selected_control_contact_track_from_label(ownship_control_contact_key)
+    if selected_track is not None:
+        for contact in contacts:
+            if int(getattr(contact, "track_number", -1) or -1) == selected_track and control_contact_allowed(contact):
+                ownship_control_contact_track = selected_track
+                return contact
+    for contact in contacts:
+        if control_contact_allowed(contact):
+            ownship_control_contact_track = int(getattr(contact, "track_number", 0) or 0)
+            return contact
+    ownship_control_contact_track = None
+    return None
+
+
 def update_multiplayer_settings_from_menu():
-    global MULTIPLAYER_CALLSIGN, MULTIPLAYER_AIRCRAFT_TYPE
+    global MULTIPLAYER_CALLSIGN, MULTIPLAYER_AIRCRAFT_TYPE, MULTIPLAYER_PLAYER_TYPE, MULTIPLAYER_TEAM, ownship_control_contact_key, multiplayer_contact_password
     MULTIPLAYER_CALLSIGN = sanitize_multiplayer_callsign(multiplayer_callsign_entry.get_text())
     if multiplayer_callsign_entry.get_text() != MULTIPLAYER_CALLSIGN:
         multiplayer_callsign_entry.set_text(MULTIPLAYER_CALLSIGN)
-    MULTIPLAYER_AIRCRAFT_TYPE = getattr(multiplayer_aircraft_dropdown, "selected_option", MULTIPLAYER_AIRCRAFT_TYPE)
+    MULTIPLAYER_AIRCRAFT_TYPE = dropdown_value(getattr(multiplayer_aircraft_dropdown, "selected_option", MULTIPLAYER_AIRCRAFT_TYPE))
+    MULTIPLAYER_PLAYER_TYPE = dropdown_value(getattr(multiplayer_player_type_dropdown, "selected_option", MULTIPLAYER_PLAYER_TYPE))
+    MULTIPLAYER_TEAM = dropdown_value(getattr(multiplayer_team_dropdown, "selected_option", MULTIPLAYER_TEAM))
+    multiplayer_contact_password = multiplayer_password_entry.get_text().strip()
+    ownship_control_contact_key = dropdown_value(getattr(multiplayer_contact_dropdown, "selected_option", ownship_control_contact_key))
+
+
+def multiplayer_platform_label():
+    player_type = dropdown_value(MULTIPLAYER_PLAYER_TYPE)
+    return dropdown_value(MULTIPLAYER_AIRCRAFT_TYPE) if player_type == "Aircraft" else player_type
 
 
 def sync_multiplayer_menu_status():
+    player_type = dropdown_value(MULTIPLAYER_PLAYER_TYPE)
+    platform = multiplayer_platform_label()
+    team = dropdown_value(MULTIPLAYER_TEAM) if player_type != "Aircraft" else ""
+    suffix = f" / {platform}" + (f" / {team}" if team else "")
+    if player_type in ("Ship", "Submarine"):
+        suffix += f" / {dropdown_value(ownship_control_contact_key)}"
     if multiplayer_role == "OFF":
-        multiplayer_status_label.set_text("MP OFF")
+        multiplayer_status_label.set_text("MP OFF" + suffix)
+    elif multiplayer_role == "SERVER":
+        multiplayer_status_label.set_text(f"SERVER {MULTIPLAYER_CALLSIGN}{suffix}")
     elif multiplayer_role == "HOST":
-        multiplayer_status_label.set_text(f"HOSTING {MULTIPLAYER_CALLSIGN} / {MULTIPLAYER_AIRCRAFT_TYPE}")
+        multiplayer_status_label.set_text(f"HOSTING {MULTIPLAYER_CALLSIGN}{suffix}")
     elif multiplayer_host_seen:
         age = max(0.0, time.time() - multiplayer_host_seen.get("last_seen", time.time()))
         multiplayer_status_label.set_text(f"JOIN READY: host {multiplayer_host_seen.get('callsign', 'HOST')} ({age:.0f}s)")
     else:
         multiplayer_status_label.set_text("JOIN: waiting for host")
 
-
 def set_multiplayer_role(role):
     global multiplayer_role, multiplayer_enabled, multiplayer_host_seen
     update_multiplayer_settings_from_menu()
-    multiplayer_role = role if role in ("OFF", "HOST", "JOIN") else "OFF"
+    multiplayer_role = role if role in ("OFF", "SERVER", "HOST", "JOIN") else "OFF"
     multiplayer_enabled = multiplayer_role != "OFF"
     multiplayer_peers.clear()
     if multiplayer_role == "OFF":
@@ -3177,7 +4450,8 @@ def set_multiplayer_role(role):
         if multiplayer_role == "JOIN":
             multiplayer_host_seen = None
         ensure_multiplayer_socket()
-        print(f"[MP] {multiplayer_role.lower()} mode as {MULTIPLAYER_CALLSIGN} ({MULTIPLAYER_AIRCRAFT_TYPE})")
+        label = "server" if multiplayer_role == "SERVER" else multiplayer_role.lower()
+        print(f"[MP] {label} mode as {MULTIPLAYER_CALLSIGN} ({MULTIPLAYER_AIRCRAFT_TYPE})")
     if "update_multiplayer_channel_assignments" in globals():
         update_multiplayer_channel_assignments()
     sync_multiplayer_menu_status()
@@ -3296,6 +4570,11 @@ radar_mode_button = pygame_gui.elements.UIButton(
     text="RADAR",
     manager=manager
 )
+nav_mode_button = pygame_gui.elements.UIButton(
+    relative_rect=pygame.Rect((1160, 10), (90, 28)),
+    text="NAV",
+    manager=manager
+)
 radar_orientation_button = pygame_gui.elements.UIButton(
     relative_rect=pygame.Rect((1160, 10), (120, 28)),
     text="TRACK UP",
@@ -3319,6 +4598,65 @@ ship_inject_button = pygame_gui.elements.UIButton(
     tool_tip_text="MSFS: inject GAIST ships. X-Plane: export ships and push multiplayer positions."
 )
 
+nav_heading_label = pygame_gui.elements.UILabel(
+    relative_rect=pygame.Rect((990, 138), (120, 24)),
+    text="CMD HDG",
+    manager=manager
+)
+nav_heading_entry = pygame_gui.elements.UITextEntryLine(
+    relative_rect=pygame.Rect((1115, 136), (105, 30)),
+    manager=manager
+)
+nav_heading_entry.set_text("120")
+nav_speed_label = pygame_gui.elements.UILabel(
+    relative_rect=pygame.Rect((1235, 138), (120, 24)),
+    text="CMD SPD",
+    manager=manager
+)
+nav_speed_entry = pygame_gui.elements.UITextEntryLine(
+    relative_rect=pygame.Rect((1360, 136), (105, 30)),
+    manager=manager
+)
+nav_speed_entry.set_text("0")
+nav_depth_label = pygame_gui.elements.UILabel(
+    relative_rect=pygame.Rect((1480, 138), (120, 24)),
+    text="CMD DEPTH",
+    manager=manager
+)
+nav_depth_entry = pygame_gui.elements.UITextEntryLine(
+    relative_rect=pygame.Rect((1605, 136), (105, 30)),
+    manager=manager
+)
+nav_depth_entry.set_text("0")
+nav_route_entry = pygame_gui.elements.UITextEntryLine(
+    relative_rect=pygame.Rect((990, 184), (610, 30)),
+    manager=manager
+)
+nav_route_entry.set_text("")
+nav_import_route_button = pygame_gui.elements.UIButton(
+    relative_rect=pygame.Rect((1610, 184), (130, 30)),
+    text="IMPORT ROUTE",
+    manager=manager
+)
+nav_route_status_label = pygame_gui.elements.UILabel(
+    relative_rect=pygame.Rect((990, 222), (750, 26)),
+    text="No route",
+    manager=manager
+)
+nav_elements = [
+    nav_heading_label,
+    nav_heading_entry,
+    nav_speed_label,
+    nav_speed_entry,
+    nav_depth_label,
+    nav_depth_entry,
+    nav_route_entry,
+    nav_import_route_button,
+    nav_route_status_label
+]
+for element in nav_elements:
+    element.hide()
+
 
 # === REGISTER LABELS ===
 register_ui_element(launch_label, pygame.Rect((20, 4), (150, 20)))
@@ -3334,6 +4672,7 @@ register_ui_element(torpedo_freq_label, pygame.Rect((830, 4), (100, 20)))
 register_ui_element(launch_button, pygame.Rect((20, 26), (150, 30)))
 register_ui_element(arm_button, pygame.Rect((180, 26), (150, 30)))
 register_ui_element(auto_buoy_button, pygame.Rect((720, 26), (100, 30)))
+register_ui_element(auto_buoy_status_label, pygame.Rect((824, 31), (96, 20)))
 
 # === REGISTER DROPDOWNS ===
 register_ui_element(depth_dropdown, pygame.Rect((350, 1028), (50, 30)))
@@ -3342,11 +4681,22 @@ register_ui_element(torpedo_mode_dropdown, pygame.Rect((730, 1028), (100, 30)))
 register_ui_element(torpedo_frequency_dropdown, pygame.Rect((840, 1028), (100, 30)))
 register_ui_element(map_mode_button, map_mode_button.relative_rect)
 register_ui_element(radar_mode_button, radar_mode_button.relative_rect)
+register_ui_element(nav_mode_button, nav_mode_button.relative_rect)
 register_ui_element(radar_orientation_button, radar_orientation_button.relative_rect)
 register_ui_element(radar_range_button, radar_range_button.relative_rect)
 register_ui_element(bearing_lines_button, bearing_lines_button.relative_rect)
 register_ui_element(ship_inject_button, ship_inject_button.relative_rect)
+register_ui_element(nav_heading_label, nav_heading_label.relative_rect)
+register_ui_element(nav_heading_entry, nav_heading_entry.relative_rect)
+register_ui_element(nav_speed_label, nav_speed_label.relative_rect)
+register_ui_element(nav_speed_entry, nav_speed_entry.relative_rect)
+register_ui_element(nav_depth_label, nav_depth_label.relative_rect)
+register_ui_element(nav_depth_entry, nav_depth_entry.relative_rect)
+register_ui_element(nav_route_entry, nav_route_entry.relative_rect)
+register_ui_element(nav_import_route_button, nav_import_route_button.relative_rect)
+register_ui_element(nav_route_status_label, nav_route_status_label.relative_rect)
 layout_top_mode_buttons(screen_width, screen_height)
+sync_stateful_button_styles()
 sync_bearing_lines_button_style()
 sync_arm_button_style()
 sync_auto_buoy_button_style()
@@ -3821,7 +5171,7 @@ ray_trace_result = None
 ray_trace_status_text = "Ray trace idle."
 
 contact_context_panel = pygame_gui.elements.UIPanel(
-    relative_rect=pygame.Rect((8, 542), (930, 248)),
+    relative_rect=pygame.Rect((8, 542), (930, 288)),
     manager=manager
 )
 contact_context_title = pygame_gui.elements.UILabel(
@@ -3832,7 +5182,7 @@ contact_context_title = pygame_gui.elements.UILabel(
 )
 contact_context_info = pygame_gui.elements.UITextBox(
     html_text="",
-    relative_rect=pygame.Rect((10, 32), (500, 202)),
+    relative_rect=pygame.Rect((10, 32), (500, 242)),
     manager=manager,
     container=contact_context_panel
 )
@@ -3845,6 +5195,83 @@ torpedo_designate_button = pygame_gui.elements.UIButton(
 contact_lines_button = pygame_gui.elements.UIButton(
     relative_rect=pygame.Rect((720, 112), (180, 30)),
     text="LINES ON",
+    manager=manager,
+    container=contact_context_panel
+)
+ship_stop_button = pygame_gui.elements.UIButton(
+    relative_rect=pygame.Rect((530, 152), (120, 30)),
+    text="REQ STOP",
+    manager=manager,
+    container=contact_context_panel
+)
+ship_heading_entry = pygame_gui.elements.UITextEntryLine(
+    relative_rect=pygame.Rect((656, 152), (54, 30)),
+    manager=manager,
+    container=contact_context_panel
+)
+ship_heading_entry.set_allowed_characters(['0','1','2','3','4','5','6','7','8','9'])
+ship_heading_button = pygame_gui.elements.UIButton(
+    relative_rect=pygame.Rect((716, 152), (86, 30)),
+    text="REQ HDG",
+    manager=manager,
+    container=contact_context_panel
+)
+ship_speed_entry = pygame_gui.elements.UITextEntryLine(
+    relative_rect=pygame.Rect((808, 152), (42, 30)),
+    manager=manager,
+    container=contact_context_panel
+)
+ship_speed_entry.set_allowed_characters(['0','1','2','3','4','5','6','7','8','9','.'])
+ship_speed_button = pygame_gui.elements.UIButton(
+    relative_rect=pygame.Rect((856, 152), (64, 30)),
+    text="REQ SPD",
+    manager=manager,
+    container=contact_context_panel
+)
+ship_deck_lock_button = pygame_gui.elements.UIButton(
+    relative_rect=pygame.Rect((530, 192), (120, 30)),
+    text="LOCK DECK",
+    manager=manager,
+    container=contact_context_panel
+)
+ship_resume_route_button = pygame_gui.elements.UIButton(
+    relative_rect=pygame.Rect((530, 192), (120, 30)),
+    text="RES RTE",
+    manager=manager,
+    container=contact_context_panel
+)
+ship_route_speed_entry = pygame_gui.elements.UITextEntryLine(
+    relative_rect=pygame.Rect((656, 192), (54, 30)),
+    manager=manager,
+    container=contact_context_panel
+)
+ship_route_speed_entry.set_allowed_characters(['0','1','2','3','4','5','6','7','8','9','.'])
+ship_route_speed_button = pygame_gui.elements.UIButton(
+    relative_rect=pygame.Rect((716, 192), (86, 30)),
+    text="RTE SPD",
+    manager=manager,
+    container=contact_context_panel
+)
+ship_spawn_aft_button = pygame_gui.elements.UIButton(
+    relative_rect=pygame.Rect((808, 192), (112, 30)),
+    text="SPAWN AFT",
+    manager=manager,
+    container=contact_context_panel
+)
+contact_route_entry = pygame_gui.elements.UITextEntryLine(
+    relative_rect=pygame.Rect((530, 232), (260, 30)),
+    manager=manager,
+    container=contact_context_panel
+)
+contact_route_button = pygame_gui.elements.UIButton(
+    relative_rect=pygame.Rect((798, 232), (122, 30)),
+    text="SET RTE",
+    manager=manager,
+    container=contact_context_panel
+)
+contact_delete_button = pygame_gui.elements.UIButton(
+    relative_rect=pygame.Rect((760, 5), (82, 26)),
+    text="DELETE",
     manager=manager,
     container=contact_context_panel
 )
@@ -3885,6 +5312,19 @@ contact_country_dropdown = pygame_gui.elements.UIDropDownMenu(
 contact_context_panel.hide()
 torpedo_designate_button.hide()
 contact_lines_button.hide()
+ship_stop_button.hide()
+ship_heading_entry.hide()
+ship_heading_button.hide()
+ship_speed_entry.hide()
+ship_speed_button.hide()
+ship_deck_lock_button.hide()
+ship_resume_route_button.hide()
+ship_route_speed_entry.hide()
+ship_route_speed_button.hide()
+ship_spawn_aft_button.hide()
+contact_route_entry.hide()
+contact_route_button.hide()
+contact_delete_button.hide()
 contact_context_close_button.hide()
 contact_type_dropdown.hide()
 contact_class_dropdown.hide()
@@ -3945,6 +5385,69 @@ def sync_torpedo_designate_button_style():
     torpedo_designate_button.rebuild()
 
 
+
+def hide_ship_command_controls():
+    ship_stop_button.hide()
+    ship_heading_entry.hide()
+    ship_heading_button.hide()
+    ship_speed_entry.hide()
+    ship_speed_button.hide()
+    ship_deck_lock_button.hide()
+    ship_resume_route_button.hide()
+    ship_route_speed_entry.hide()
+    ship_route_speed_button.hide()
+    ship_spawn_aft_button.hide()
+    contact_route_entry.hide()
+    contact_route_button.hide()
+
+
+def show_ship_command_controls(update_heading_text=False):
+    ship_stop_button.show()
+    ship_heading_entry.show()
+    ship_heading_button.set_text("REQ HDG")
+    ship_heading_button.show()
+    ship_speed_entry.show()
+    ship_speed_button.show()
+    ship_resume_route_button.show()
+    ship_route_speed_entry.show()
+    ship_route_speed_button.show()
+    sync_ship_command_controls(update_heading_text=update_heading_text)
+    if ship_deck_carry_enabled:
+        ship_deck_lock_button.show()
+    else:
+        ship_deck_lock_button.hide()
+    if selected_contact_is_friendly_surface_ship():
+        contact_route_entry.show()
+        contact_route_button.show()
+        ship_spawn_aft_button.hide()
+    else:
+        contact_route_entry.hide()
+        contact_route_button.hide()
+        ship_spawn_aft_button.show()
+
+def sync_ship_command_controls(update_heading_text=False):
+    if not selected_contact_is_surface_ship():
+        return
+    ensure_ship_command_state(selected_contact)
+    ship_stop_button.set_text("REQ UNDERWAY" if ship_commanded_stopped(selected_contact) else "REQ STOP")
+    deck_locked = ship_deck_lock_is_active_for_contact(selected_contact)
+    ship_deck_lock_button.set_text("UNLOCK DECK" if deck_locked else "LOCK DECK")
+    deck_colour = pygame.Color("#99C979") if deck_locked else pygame.Color("#4d6fa8")
+    ship_deck_lock_button.colours["normal_bg"] = deck_colour
+    ship_deck_lock_button.colours["hovered_bg"] = deck_colour
+    ship_deck_lock_button.colours["active_bg"] = deck_colour
+    ship_deck_lock_button.rebuild()
+    if update_heading_text or not ship_heading_entry.get_text().strip():
+        ship_heading_entry.set_text(f"{float(getattr(selected_contact, 'commanded_heading', getattr(selected_contact, 'bearing', 0)) or 0) % 360:03.0f}")
+    if update_heading_text or not ship_speed_entry.get_text().strip():
+        ship_speed_entry.set_text(f"{float(getattr(selected_contact, 'commanded_speed', getattr(selected_contact, 'speed', 0.0)) or 0.0):.1f}")
+    if update_heading_text or not ship_route_speed_entry.get_text().strip():
+        route_speed = float(getattr(selected_contact, "route_speed_kts", getattr(selected_contact, "commanded_speed", getattr(selected_contact, "speed", 0.0))) or 0.0)
+        ship_route_speed_entry.set_text(f"{route_speed:.1f}")
+    has_route = len(getattr(selected_contact, "route_waypoints", []) or []) > 1
+    ship_resume_route_button.set_text("RES RTE" if has_route else "NO RTE")
+
+
 def sync_contact_lines_button_style():
     if selected_contact is not None and getattr(selected_contact, "bearing_lines_hidden", False):
         contact_lines_button.set_text("LINES OFF")
@@ -3956,6 +5459,117 @@ def sync_contact_lines_button_style():
     contact_lines_button.colours["hovered_bg"] = new_colour
     contact_lines_button.colours["active_bg"] = new_colour
     contact_lines_button.rebuild()
+
+def selected_contact_is_surface_ship():
+    if selected_contact is None:
+        return False
+    return (
+        getattr(selected_contact, "internal_type", "") == "Surface-Ship" or
+        getattr(selected_contact, "classification_type", "") == "Surface-Ship"
+    )
+
+def selected_contact_is_friendly_surface_ship():
+    if not selected_contact_is_surface_ship():
+        return False
+    identity = str(getattr(selected_contact, "identity_status", "P") or "P")
+    team = str(getattr(selected_contact, "team", "Neutral") or "Neutral")
+    return identity in ("F", "?F") or team == "BLUFOR"
+
+def pause_ship_route_for_manual(contact, reason="manual command"):
+    if getattr(contact, "route_active", False):
+        contact.route_active = False
+        contact.route_manual_paused = True
+        contact.route_status = f"Route paused: {reason}"
+        print(f"Ship track {getattr(contact, 'track_number', '?')} route paused for {reason}")
+
+
+def request_ship_stop(contact):
+    ensure_ship_command_state(contact)
+    pause_ship_route_for_manual(contact, "speed command")
+    if ship_commanded_stopped(contact):
+        contact.commanded_speed = max(ship_default_underway_speed_kts, float(getattr(contact, "ship_underway_speed", ship_default_underway_speed_kts) or ship_default_underway_speed_kts))
+        print(f"Ship track {getattr(contact, 'track_number', '?')} requested underway at {contact.commanded_speed:.1f} kt")
+    else:
+        contact.ship_underway_speed = max(ship_default_underway_speed_kts, float(getattr(contact, "speed", 0.0) or 0.0), float(getattr(contact, "commanded_speed", 0.0) or 0.0))
+        contact.commanded_speed = 0.0
+        current_speed = float(getattr(contact, "speed", 0.0) or 0.0)
+        print(f"Ship track {getattr(contact, 'track_number', '?')} requested stop; slowing from {current_speed:.1f} kt")
+
+
+def request_ship_heading(contact, heading_deg):
+    try:
+        heading_deg = float(heading_deg) % 360.0
+    except (TypeError, ValueError):
+        heading_deg = float(getattr(contact, "bearing", 0) or 0) % 360.0
+    ensure_ship_command_state(contact)
+    pause_ship_route_for_manual(contact, "heading command")
+    current_speed = max(0.0, float(getattr(contact, "speed", 0.0) or 0.0))
+    if current_speed > 0.2:
+        contact.commanded_speed = current_speed
+        contact.ship_underway_speed = max(
+            current_speed,
+            float(getattr(contact, "ship_underway_speed", 0.0) or 0.0),
+            float(getattr(contact, "commanded_speed", 0.0) or 0.0)
+        )
+    contact.commanded_heading = heading_deg
+    print(f"Ship track {getattr(contact, 'track_number', '?')} requested heading {heading_deg:03.0f} at {float(getattr(contact, 'commanded_speed', current_speed) or 0.0):.1f} kt")
+
+
+def request_ship_speed(contact, speed_kts):
+    try:
+        speed_kts = max(0.0, float(speed_kts))
+    except (TypeError, ValueError):
+        speed_kts = max(0.0, float(getattr(contact, "commanded_speed", getattr(contact, "speed", 0.0)) or 0.0))
+    ensure_ship_command_state(contact)
+    pause_ship_route_for_manual(contact, "speed command")
+    contact.commanded_speed = speed_kts
+    if speed_kts > 0.2:
+        contact.ship_underway_speed = speed_kts
+    print(f"Ship track {getattr(contact, 'track_number', '?')} requested speed {speed_kts:.1f} kt")
+
+
+def set_ship_route_speed(contact, speed_kts):
+    try:
+        speed_kts = max(0.0, float(speed_kts))
+    except (TypeError, ValueError):
+        speed_kts = max(0.0, float(getattr(contact, "route_speed_kts", getattr(contact, "speed", 0.0)) or 0.0))
+    if len(getattr(contact, "route_waypoints", []) or []) < 2:
+        print(f"Ship track {getattr(contact, 'track_number', '?')} has no route speed to set")
+        return False
+    contact.route_speed_kts = speed_kts
+    if getattr(contact, "route_active", False):
+        contact.commanded_speed = speed_kts
+    autosave_ship_route_to_config(contact)
+    print(f"Ship track {getattr(contact, 'track_number', '?')} enroute speed set to {speed_kts:.1f} kt")
+    return True
+
+
+def resume_ship_route(contact):
+    points = getattr(contact, "route_waypoints", []) or []
+    if len(points) < 2:
+        print(f"Ship track {getattr(contact, 'track_number', '?')} has no route to resume")
+        return False
+    speed_kts = max(0.0, float(getattr(contact, "route_speed_kts", getattr(contact, "speed", 0.0)) or 0.0))
+    if speed_kts <= 0.0:
+        speed_kts = max(ship_default_underway_speed_kts, float(getattr(contact, "ship_underway_speed", 0.0) or 0.0), float(getattr(contact, "speed", 0.0) or 0.0))
+        contact.route_speed_kts = speed_kts
+    if not getattr(contact, "route_loop", False) and int(getattr(contact, "route_index", 0) or 0) >= len(points) - 1:
+        contact.route_index = max(0, len(points) - 2)
+    contact.route_active = True
+    contact.route_manual_paused = False
+    contact.route_status = "Route resumed"
+    update_ship_route_following(contact)
+    autosave_ship_route_to_config(contact)
+    print(f"Ship track {getattr(contact, 'track_number', '?')} resumed route at {speed_kts:.1f} kt")
+    return True
+
+
+def current_aircraft_heading_deg(default=0.0):
+    try:
+        return float(hdg or default) % 360.0
+    except (TypeError, ValueError):
+        return float(default) % 360.0
+
 
 def contact_context_dropdown_rect(kind):
     if kind == "type":
@@ -4057,6 +5671,8 @@ def update_contact_context_panel():
         contact_context_panel.hide()
         torpedo_designate_button.hide()
         contact_lines_button.hide()
+        hide_ship_command_controls()
+        contact_delete_button.hide()
         contact_context_close_button.hide()
         contact_type_dropdown.hide()
         contact_class_dropdown.hide()
@@ -4070,6 +5686,8 @@ def update_contact_context_panel():
         contact_context_panel.hide()
         torpedo_designate_button.hide()
         contact_lines_button.hide()
+        hide_ship_command_controls()
+        contact_delete_button.hide()
         contact_context_close_button.hide()
         contact_type_dropdown.hide()
         contact_class_dropdown.hide()
@@ -4081,6 +5699,8 @@ def update_contact_context_panel():
         contact_context_panel.hide()
         torpedo_designate_button.hide()
         contact_lines_button.hide()
+        hide_ship_command_controls()
+        contact_delete_button.hide()
         contact_context_close_button.hide()
         contact_type_dropdown.hide()
         contact_class_dropdown.hide()
@@ -4093,6 +5713,11 @@ def update_contact_context_panel():
     contact_context_panel.show()
     torpedo_designate_button.show()
     contact_lines_button.show()
+    if selected_contact_is_surface_ship():
+        show_ship_command_controls()
+    else:
+        hide_ship_command_controls()
+    contact_delete_button.hide()
     contact_context_close_button.show()
     sync_torpedo_designate_button_style()
     sync_contact_lines_button_style()
@@ -4109,9 +5734,13 @@ def update_contact_context_panel():
         f"Class: {selected_contact.classification_class}<br>"
         f"Identity: {identity_status} - {identity_label}<br>"
         f"Country: {getattr(selected_contact, 'country', 'Unknown')}<br>"
+        f"Team: {getattr(selected_contact, 'team', 'Neutral')}<br>"
         f"Lat: {selected_contact.contact_lat:.5f}<br>"
         f"Lon: {selected_contact.contact_long:.5f}<br>"
         f"Speed: {selected_contact.speed:.1f} kt | Depth: {selected_contact.depth:.0f} m<br>"
+        f"Command: {float(getattr(selected_contact, 'commanded_speed', selected_contact.speed) or 0):.1f} kt / {float(getattr(selected_contact, 'commanded_heading', selected_contact.bearing) or 0) % 360:03.0f} deg<br>"
+        f"Route: {getattr(selected_contact, 'route_status', 'No route')} / {float(getattr(selected_contact, 'route_speed_kts', 0.0) or 0.0):.1f} kt<br>"
+        f"Shadow: {getattr(selected_contact, 'shadow_status', getattr(selected_contact, 'shadow_target_name', '') or 'None')}<br>"
         f"Bearing: {selected_contact.bearing:.0f} deg | Buoys: {len(selected_contact.detecting_buoys)}<br>"
         f"Torpedo: {'DESIGNATED' if torpedo_designated_contact is selected_contact else 'None'}<br>"
         f"{contact_propulsor_summary(selected_contact)}<br>"
@@ -4142,6 +5771,11 @@ def set_selected_contact(contact):
     contact_context_panel.show()
     torpedo_designate_button.show()
     contact_lines_button.show()
+    if selected_contact_is_surface_ship():
+        show_ship_command_controls(update_heading_text=True)
+    else:
+        hide_ship_command_controls()
+    contact_delete_button.hide()
     contact_context_close_button.show()
     sync_torpedo_designate_button_style()
 
@@ -4884,7 +6518,7 @@ class Torpedo:
 def launch_torp():
     global sonoArmed
     if sonoArmed == True:
-        launch_sound.play()
+        play_launch_sound()
         launch_pos = latlong_to_pix(player_pos.x, player_pos.y)
         torp_array.append(Torpedo(launch_pos, selected_torpedo_frequency, hdg, torpedo_surface, selected_torpedo_mode))
         sonoArmed = False
@@ -4905,7 +6539,7 @@ def launch_xbt():
     global sonoArmed, xbt_counter, latest_xbt_profile, xbt_panel_selected_label
     global xbt_exists
     if sonoArmed == True:
-        launch_sound.play()
+        play_launch_sound()
         xbt_channel = displayed_channel
         bt_sono = pygame.Vector2(latlong_to_pix(player_pos.x, player_pos.y))
         spawn_splash(bt_sono)
@@ -4970,7 +6604,7 @@ map_group = PyscrollGroup(map_layer=map_layer, default_layer=1)
 
 def launch_active_sonobuoy():
     global sonoArmed, sono_time_up, active_sonobuoy
-    launch_sound.play()
+    play_launch_sound()
     if sonoArmed == True:
 
         sono_timer.start()
@@ -4978,7 +6612,7 @@ def launch_active_sonobuoy():
         
 def launch_sonobuoy():
     global sonoArmed, sono_time_up
-    launch_sound.play()
+    play_launch_sound()
 
     
     if sonoArmed == True:
@@ -6259,6 +7893,16 @@ class Contact:
         self.blade_count = None
         self.shaft_rate_hz = None
         self.blade_rate_hz = None
+        self.team = "Neutral"
+        self.route_waypoints = []
+        self.shadow_target_name = ""
+        self.shadow_distance_nm = 5.0
+        self.route_index = 0
+        self.route_active = False
+        self.route_loop = False
+        self.route_speed_kts = None
+        self.route_started_at_utc = None
+        self.route_status = "No route"
         # Convert lat/long to pixel position
         x, y = latlong_to_pix(contact_lat, contact_long)
 
@@ -6397,6 +8041,8 @@ def update_submarine_reactions(dt_seconds):
 
     for contact in contacts:
         if not contact_is_submarine(contact):
+            continue
+        if str(getattr(contact, "shadow_target_name", "") or "").strip():
             continue
 
         ensure_contact_base_tones(contact)
@@ -6808,6 +8454,193 @@ def make_civilian_surface_contact(name, contact_lat, contact_long, speed, bearin
     return contact
 
 
+def aishub_config_value(config_obj, key, default=None):
+    ais_config = config_obj.get("aishub", {}) if isinstance(config_obj, dict) else {}
+    if isinstance(ais_config, dict) and key in ais_config:
+        return ais_config.get(key)
+    flat_key = f"aishub_{key}"
+    if isinstance(config_obj, dict) and flat_key in config_obj:
+        return config_obj.get(flat_key)
+    return default
+
+
+def aishub_enabled(config_obj):
+    username = aishub_username(config_obj)
+    enabled = aishub_config_value(config_obj, "enabled", bool(username))
+    return bool(enabled and username)
+
+
+def aishub_username(config_obj):
+    return str(aishub_config_value(config_obj, "username", os.environ.get("AISHUB_USERNAME", "")) or "").strip()
+
+
+def aishub_max_contacts(config_obj):
+    try:
+        value = int(aishub_config_value(config_obj, "max_contacts", os.environ.get("AISHUB_MAX_CONTACTS", AISHUB_DEFAULT_MAX_CONTACTS)))
+    except (TypeError, ValueError):
+        value = AISHUB_DEFAULT_MAX_CONTACTS
+    return max(1, min(1000, value))
+
+
+def aishub_interval_minutes(config_obj):
+    try:
+        value = int(aishub_config_value(config_obj, "interval_minutes", os.environ.get("AISHUB_INTERVAL_MINUTES", 180)))
+    except (TypeError, ValueError):
+        value = 180
+    return max(1, value)
+
+
+def aishub_bounds(config_obj):
+    bounds = aishub_config_value(config_obj, "bounds", None)
+    if not isinstance(bounds, dict):
+        bounds = {}
+    result = {}
+    for key in ("latmin", "latmax", "lonmin", "lonmax"):
+        value = bounds.get(key, aishub_config_value(config_obj, key, None))
+        if value is None or value == "":
+            continue
+        try:
+            result[key] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def normalize_ais_float(value, default=0.0):
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(result):
+        return float(default)
+    return result
+
+
+def aishub_vessel_dimensions(vessel):
+    a = max(0.0, normalize_ais_float(vessel.get("A"), 0.0))
+    b = max(0.0, normalize_ais_float(vessel.get("B"), 0.0))
+    c = max(0.0, normalize_ais_float(vessel.get("C"), 0.0))
+    d = max(0.0, normalize_ais_float(vessel.get("D"), 0.0))
+    length_m = a + b
+    width_m = c + d
+    return length_m, width_m, length_m * max(1.0, width_m)
+
+
+def aishub_is_civilian_vessel(vessel):
+    try:
+        vessel_type = int(vessel.get("TYPE", 0) or 0)
+    except (TypeError, ValueError):
+        vessel_type = 0
+    if vessel_type == 35:
+        return False
+    return 30 <= vessel_type <= 89
+
+
+def aishub_fetch_vessels(config_obj, force=False):
+    global aishub_last_fetch_at, aishub_last_error
+    if not aishub_enabled(config_obj):
+        return []
+    now = time.time()
+    if not force and now - aishub_last_fetch_at < AISHUB_MIN_REFRESH_SECONDS:
+        return []
+
+    params = {
+        "username": aishub_username(config_obj),
+        "format": 1,
+        "output": "json",
+        "compress": 0,
+        "interval": aishub_interval_minutes(config_obj)
+    }
+    params.update(aishub_bounds(config_obj))
+    url = AISHUB_API_URL + "?" + urllib.parse.urlencode(params)
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        aishub_last_error = str(exc)
+        print(f"[AISHub] fetch failed: {exc}")
+        aishub_last_fetch_at = now
+        return []
+
+    aishub_last_fetch_at = now
+    meta = payload[0] if isinstance(payload, list) and payload else {}
+    if isinstance(meta, dict) and meta.get("ERROR"):
+        aishub_last_error = str(meta)
+        print(f"[AISHub] API error: {aishub_last_error}")
+        return []
+    vessels = payload[1] if isinstance(payload, list) and len(payload) > 1 and isinstance(payload[1], list) else []
+    aishub_last_error = ""
+    return vessels
+
+
+def aishub_civilian_contacts_from_vessels(vessels, max_contacts):
+    ranked = []
+    seen_mmsi = set()
+    for vessel in vessels:
+        if not isinstance(vessel, dict) or not aishub_is_civilian_vessel(vessel):
+            continue
+        mmsi = str(vessel.get("MMSI", "")).strip()
+        if not mmsi or mmsi in seen_mmsi:
+            continue
+        seen_mmsi.add(mmsi)
+        lat_value = normalize_ais_float(vessel.get("LATITUDE"), None)
+        lon_value = normalize_ais_float(vessel.get("LONGITUDE"), None)
+        if lat_value is None or lon_value is None or not (-90 <= lat_value <= 90 and -180 <= lon_value <= 180):
+            continue
+        length_m, width_m, size_score = aishub_vessel_dimensions(vessel)
+        ranked.append((size_score, length_m, width_m, vessel))
+
+    ranked.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    contacts_created = []
+    for _, length_m, width_m, vessel in ranked[:max_contacts]:
+        name = str(vessel.get("NAME") or vessel.get("MMSI") or "AIS CIV").strip()[:32]
+        speed = normalize_ais_float(vessel.get("SOG"), 0.0)
+        if speed >= 102.3:
+            speed = 0.0
+        bearing = normalize_ais_float(vessel.get("HEADING"), 511.0)
+        if bearing >= 360.0:
+            bearing = normalize_ais_float(vessel.get("COG"), 0.0)
+            if bearing >= 360.0:
+                bearing = 0.0
+        contact = make_civilian_surface_contact(
+            name=name,
+            contact_lat=normalize_ais_float(vessel.get("LATITUDE"), 0.0),
+            contact_long=normalize_ais_float(vessel.get("LONGITUDE"), 0.0),
+            speed=max(0.0, speed),
+            bearing=bearing % 360.0
+        )
+        contact.source = "AISHub"
+        contact.aishub_mmsi = str(vessel.get("MMSI", ""))
+        contact.aishub_imo = str(vessel.get("IMO", ""))
+        contact.aishub_type = int(vessel.get("TYPE", 0) or 0)
+        contact.length_m = length_m
+        contact.width_m = width_m
+        contact.track_number = int(vessel.get("MMSI", contact.track_number) or contact.track_number) % 100000
+        contacts_created.append(contact)
+    return contacts_created
+
+
+def refresh_aishub_civilian_contacts(config_obj, force=False):
+    global aishub_disabled_notice_shown
+    if not aishub_enabled(config_obj):
+        if not aishub_disabled_notice_shown:
+            if not aishub_username(config_obj):
+                print("[AISHub] disabled: set aishub.username in config.json or AISHUB_USERNAME")
+            else:
+                print("[AISHub] disabled by config")
+            aishub_disabled_notice_shown = True
+        return 0
+    aishub_disabled_notice_shown = False
+    vessels = aishub_fetch_vessels(config_obj, force=force)
+    if not vessels:
+        return 0
+    contacts[:] = [contact for contact in contacts if getattr(contact, "source", "") != "AISHub"]
+    max_contacts = aishub_max_contacts(config_obj)
+    ais_contacts = aishub_civilian_contacts_from_vessels(vessels, max_contacts)
+    contacts.extend(ais_contacts)
+    print(f"[AISHub] imported {len(ais_contacts)} civilian vessels from {len(vessels)} AIS records, largest-first cap {max_contacts}")
+    return len(ais_contacts)
+
 def whale_acoustic_profile():
     base_shift = random.uniform(0.85, 1.15)
     source_db = random.uniform(82, 94)
@@ -6872,6 +8705,7 @@ def add_contact_creation_row_for_contact(contact, range_nm=0):
         getattr(contact, "gaist_model_title", "Auto") or "Auto"
     )
     row.set_broadcasting(getattr(contact, "broadcasting", False))
+    row.set_team(getattr(contact, "team", "Neutral"))
     row.sub_speed_textbox.set_text(str(int(round(float(getattr(contact, "speed", 0) or 0)))))
     row.sub_bearing_textbox.set_text(str(int(round(float(getattr(contact, "bearing", 0) or 0)))))
     row.sub_depth_textbox.set_text(str(int(round(float(getattr(contact, "depth", 0) or 0)))))
@@ -6897,43 +8731,131 @@ def typed_civilian_origin_latlon():
     return typed_lat, typed_lon
 
 
-def generate_dynamic_civilian_traffic(count=8, origin=None):
-    if origin is None:
-        typed_origin = typed_civilian_origin_latlon()
-        if typed_origin is False:
-            return []
-        origin = typed_origin or current_ownship_latlon()
-    if origin is None:
-        return []
-    origin_lat, origin_lon = origin
-    print(f"Generating civilian traffic around {origin_lat:.5f}, {origin_lon:.5f}")
+def generate_dynamic_civilian_traffic(count=24, origin=None):
+    print("Generating civilian traffic around the world")
     created_contacts = []
     start_number = len([c for c in contacts if getattr(c, "internal_class", "") == "Civilian"]) + 1
 
+    skipped = 0
     for index in range(count):
-        spawn_bearing = random.uniform(0, 360)
-        spawn_range_nm = random.uniform(4, 35)
-        contact_lat, contact_lon = destination_from_bearing(
-            origin_lat,
-            origin_lon,
-            spawn_bearing,
-            spawn_range_nm
-        )
+        sea_point = random_global_sea_point()
+        if sea_point is None:
+            skipped += 1
+            continue
+        contact_lat, contact_lon, _, spawn_bearing = sea_point
         speed = random.uniform(6, 24)
         course = (spawn_bearing + random.uniform(65, 295)) % 360
         contact = make_civilian_surface_contact(
-            f"CIV {start_number + index:02d}",
+            f"CIV {start_number + len(created_contacts):02d}",
             contact_lat,
             contact_lon,
             speed,
             course
         )
+        contact.source = "RandomCivilian"
         contacts.append(contact)
         created_contacts.append(contact)
-        add_contact_creation_row_for_contact(contact, spawn_range_nm)
+        add_contact_creation_row_for_contact(contact, 0)
 
-    print(f"Generated {len(created_contacts)} dynamic civilian surface contacts")
+    print(f"Generated {len(created_contacts)} global civilian surface contacts offshore; skipped {skipped}")
     return created_contacts
+
+
+def multiplayer_player_traffic_origins():
+    origins = []
+    own_latlon = None if DEDICATED_HOST_MODE else (current_player_lat_lon_for_mp() if "current_player_lat_lon_for_mp" in globals() else None)
+    if own_latlon is not None:
+        origins.append({
+            "id": MULTIPLAYER_ID,
+            "label": MULTIPLAYER_CALLSIGN,
+            "lat": float(own_latlon[0]),
+            "lon": float(own_latlon[1])
+        })
+    for peer in multiplayer_peers.values():
+        try:
+            origins.append({
+                "id": str(peer.get("id", "")),
+                "label": str(peer.get("callsign", "MP")),
+                "lat": float(peer.get("lat")),
+                "lon": float(peer.get("lon"))
+            })
+        except (TypeError, ValueError):
+            continue
+    return origins
+
+
+def contact_within_any_origin(contact, origins, radius_nm):
+    for origin in origins:
+        if haversine(origin["lat"], origin["lon"], contact.contact_lat, contact.contact_long) <= radius_nm:
+            return True
+    return False
+
+
+def random_host_civilian_contact(origin, name):
+    sea_point = random_sea_point_near(
+        origin["lat"],
+        origin["lon"],
+        min_range_nm=5.0,
+        max_range_nm=HOST_CIVILIAN_TRAFFIC_RADIUS_NM,
+        min_offshore_nm=CIVILIAN_TRAFFIC_MIN_OFFSHORE_NM,
+        attempts=220
+    )
+    if sea_point is None:
+        return None
+    contact_lat, contact_lon, _, spawn_bearing = sea_point
+    contact = make_civilian_surface_contact(
+        name,
+        contact_lat,
+        contact_lon,
+        random.uniform(6, 24),
+        (spawn_bearing + random.uniform(65, 295)) % 360
+    )
+    contact.source = "HostCivilian"
+    contact.host_civilian_owner = origin["id"]
+    return contact
+
+
+def update_host_civilian_traffic(force=False):
+    global host_civilian_traffic_last_update, multiplayer_last_state_broadcast
+    if not multiplayer_is_host_role():
+        return 0
+    now = time.time()
+    if not force and now - host_civilian_traffic_last_update < HOST_CIVILIAN_TRAFFIC_REFRESH_SECONDS:
+        return 0
+    host_civilian_traffic_last_update = now
+
+    origins = multiplayer_player_traffic_origins()
+    if not origins:
+        return 0
+
+    before_count = len(contacts)
+    contacts[:] = [
+        contact for contact in contacts
+        if getattr(contact, "source", "") != "HostCivilian" or
+        contact_within_any_origin(contact, origins, HOST_CIVILIAN_TRAFFIC_RADIUS_NM * 1.15)
+    ]
+
+    created = 0
+    start_number = len([contact for contact in contacts if getattr(contact, "internal_class", "") == "Civilian"]) + 1
+    for origin in origins:
+        nearby = [
+            contact for contact in contacts
+            if getattr(contact, "source", "") == "HostCivilian" and
+            haversine(origin["lat"], origin["lon"], contact.contact_lat, contact.contact_long) <= HOST_CIVILIAN_TRAFFIC_RADIUS_NM
+        ]
+        needed = max(0, HOST_CIVILIAN_TRAFFIC_TARGET_PER_PLAYER - len(nearby))
+        for _ in range(needed):
+            contact = random_host_civilian_contact(origin, f"CIV {start_number + created:02d}")
+            if contact is None:
+                continue
+            contacts.append(contact)
+            created += 1
+
+    removed = before_count + created - len(contacts)
+    if created or removed:
+        multiplayer_last_state_broadcast = 0.0
+        print(f"[HOST] civilian traffic: +{created}, -{removed}, {len(origins)} player areas within {HOST_CIVILIAN_TRAFFIC_RADIUS_NM:.0f} NM")
+    return created
 
 
 def generate_random_whales(count=None, origin=None):
@@ -7695,7 +9617,8 @@ def start_listen_audio_thread():
     listen_audio_thread.start()
 
 
-start_listen_audio_thread()
+if not DEDICATED_HOST_MODE:
+    start_listen_audio_thread()
 
 
 def stop_listen_audio():
@@ -8371,8 +10294,722 @@ def parse_navigraph_waypoints(text):
     return waypoints
 
 
+def set_contact_latlon(contact, lat_value, lon_value):
+    contact.contact_lat = float(lat_value)
+    contact.contact_long = float(lon_value)
+    x, y = latlong_to_pix(contact.contact_lat, contact.contact_long)
+    contact.pos = pygame.Vector2(x, y)
+    if hasattr(contact, "contact_rect"):
+        contact.contact_rect.center = (round(contact.pos.x), round(contact.pos.y))
+
+
+def shadow_target_name_from_saved_config(data):
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("shadow_target", data.get("shadow_target_name", "")) or "").strip()
+
+
+def shadow_distance_from_saved_config(data):
+    if not isinstance(data, dict):
+        return 5.0
+    try:
+        return max(0.1, float(data.get("shadow_distance_nm", data.get("shadow_distance", 5.0)) or 5.0))
+    except (TypeError, ValueError):
+        return 5.0
+
+
+def contact_shadow_target(contact):
+    target_name = str(getattr(contact, "shadow_target_name", "") or "").strip()
+    if not target_name:
+        return None
+    contact_name = str(getattr(contact, "name", "") or "").strip().lower()
+    target_key = target_name.lower()
+    for candidate in contacts:
+        if candidate is contact or is_dicass_ping_contact(candidate):
+            continue
+        if str(getattr(candidate, "name", "") or "").strip().lower() == target_key:
+            return candidate
+    return None
+
+
+def shadow_slot_for_contact(contact, target):
+    distance_nm = max(0.1, float(getattr(contact, "shadow_distance_nm", 5.0) or 5.0))
+    target_bearing = float(getattr(target, "bearing", 0.0) or 0.0) % 360.0
+    return destination_from_bearing(
+        float(getattr(target, "contact_lat", 0.0) or 0.0),
+        float(getattr(target, "contact_long", 0.0) or 0.0),
+        (target_bearing + 180.0) % 360.0,
+        distance_nm
+    )
+
+
+def command_contact_shadow_following(contact):
+    target = contact_shadow_target(contact)
+    if target is None:
+        return False
+    slot_lat, slot_lon = shadow_slot_for_contact(contact, target)
+    range_to_slot_nm = haversine(contact.contact_lat, contact.contact_long, slot_lat, slot_lon)
+    target_speed = max(0.0, float(getattr(target, "speed", getattr(contact, "speed", 0.0)) or 0.0))
+    max_shadow_speed = max(
+        target_speed + shadow_catchup_speed_margin_kts,
+        float(getattr(contact, "original_speed", target_speed) or target_speed),
+        float(getattr(contact, "ship_underway_speed", target_speed) or target_speed),
+        float(getattr(contact, "commanded_speed", target_speed) or target_speed)
+    )
+    if range_to_slot_nm <= 0.05:
+        commanded_heading = float(getattr(target, "bearing", getattr(contact, "bearing", 0.0)) or 0.0) % 360.0
+        commanded_speed = target_speed
+    else:
+        commanded_heading = haversine_bearing(contact.contact_lat, contact.contact_long, slot_lat, slot_lon)
+        commanded_speed = min(max_shadow_speed, target_speed + min(shadow_catchup_speed_margin_kts, range_to_slot_nm * 2.0))
+    contact.commanded_heading = commanded_heading
+    contact.commanded_speed = max(0.0, commanded_speed)
+    contact.desired_bearing = contact.commanded_heading
+    contact.target_speed = contact.commanded_speed
+    contact.shadow_status = f"Shadow {getattr(target, 'name', '?')} {range_to_slot_nm:.1f}NM HDG {contact.commanded_heading:03.0f} SPD {contact.commanded_speed:.1f}"
+    return True
+
+
+def apply_shadow_command_dynamics(contact, dt_seconds):
+    ensure_ship_command_state(contact)
+    dt_seconds = max(0.0, float(dt_seconds or 0.0))
+    current_speed = max(0.0, float(getattr(contact, "speed", 0.0) or 0.0))
+    target_speed = max(0.0, float(getattr(contact, "commanded_speed", current_speed) or 0.0))
+    speed_rate = ship_command_accel_kts_s if target_speed > current_speed else ship_command_decel_kts_s
+    contact.speed = ship_approach_value(current_speed, target_speed, speed_rate * dt_seconds)
+    contact.bearing = ship_approach_bearing(
+        float(getattr(contact, "bearing", 0.0) or 0.0),
+        float(getattr(contact, "commanded_heading", getattr(contact, "bearing", 0.0)) or 0.0),
+        ship_command_turn_rate_dps * dt_seconds
+    )
+
+
+def update_contact_shadow_following(contact, dt_seconds):
+    if not command_contact_shadow_following(contact):
+        return False
+    apply_shadow_command_dynamics(contact, dt_seconds)
+    if getattr(contact, "speed", 0) != 0:
+        contact.move(dt_seconds)
+    return True
+
+
+def snap_contact_shadow_to_slot(contact):
+    target = contact_shadow_target(contact)
+    if target is None:
+        return False
+    shadow_lat, shadow_lon = shadow_slot_for_contact(contact, target)
+    set_contact_latlon(contact, shadow_lat, shadow_lon)
+    contact.bearing = float(getattr(target, "bearing", getattr(contact, "bearing", 0.0)) or 0.0) % 360.0
+    contact.speed = float(getattr(target, "speed", getattr(contact, "speed", 0.0)) or 0.0)
+    contact.commanded_heading = contact.bearing
+    contact.commanded_speed = contact.speed
+    return True
+
+
+def update_all_contact_shadow_following(passes=3, snap=False):
+    updated = False
+    for _ in range(max(1, int(passes))):
+        pass_updated = False
+        for contact in list(contacts):
+            if is_dicass_ping_contact(contact):
+                continue
+            did_update = snap_contact_shadow_to_slot(contact) if snap else command_contact_shadow_following(contact)
+            if did_update:
+                pass_updated = True
+        updated = updated or pass_updated
+        if not pass_updated:
+            break
+    return updated
+
+
+def parse_route_timestamp(value, default=None):
+    if value is None or value == "":
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return default
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return default
+
+
+def route_timestamp_to_config(value):
+    if value is None:
+        return None
+    try:
+        return datetime.datetime.fromtimestamp(float(value), datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def route_waypoints_to_config(points):
+    return [[float(lat_value), float(lon_value)] for lat_value, lon_value in points]
+
+
+def parse_route_waypoints(value):
+    points = []
+    if value is None:
+        return points
+    if isinstance(value, str):
+        for point in parse_navigraph_waypoints(value):
+            points.append(pix_to_latlong(point.x, point.y))
+        if points:
+            return points
+        decimal_pattern = re.compile(r"(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)")
+        for match in decimal_pattern.finditer(value):
+            lat_value = float(match.group(1))
+            lon_value = float(match.group(2))
+            if -90 <= lat_value <= 90 and -180 <= lon_value <= 180:
+                points.append((lat_value, lon_value))
+        return points
+    if isinstance(value, dict):
+        value = value.get("waypoints", [])
+    if not isinstance(value, list):
+        return points
+    for item in value:
+        try:
+            if isinstance(item, dict):
+                lat_value = float(item.get("lat", item.get("latitude")))
+                lon_value = float(item.get("lon", item.get("longitude")))
+            elif isinstance(item, str):
+                nested = parse_route_waypoints(item)
+                points.extend(nested)
+                continue
+            else:
+                lat_value = float(item[0])
+                lon_value = float(item[1])
+            if -90 <= lat_value <= 90 and -180 <= lon_value <= 180:
+                points.append((lat_value, lon_value))
+        except (TypeError, ValueError, IndexError):
+            continue
+    return points
+
+
+def route_total_distance_nm(points, loop=False):
+    if len(points) < 2:
+        return 0.0
+    total = 0.0
+    leg_count = len(points) if loop else len(points) - 1
+    for index in range(leg_count):
+        start = points[index]
+        end = points[(index + 1) % len(points)]
+        total += haversine(start[0], start[1], end[0], end[1])
+    return total
+
+
+def route_position_at_elapsed(points, speed_kts, elapsed_seconds, loop=False):
+    if not points:
+        return None
+    if len(points) == 1 or speed_kts <= 0:
+        lat_value, lon_value = points[0]
+        return lat_value, lon_value, 0.0, 0, False
+
+    remaining_nm = max(0.0, float(speed_kts) * max(0.0, float(elapsed_seconds)) / 3600.0)
+    total_nm = route_total_distance_nm(points, loop)
+    if loop and total_nm > 1e-6:
+        remaining_nm = remaining_nm % total_nm
+
+    index = 0
+    while index < len(points) - 1 or loop:
+        start = points[index]
+        next_index = (index + 1) % len(points)
+        end = points[next_index]
+        leg_nm = haversine(start[0], start[1], end[0], end[1])
+        if leg_nm <= 1e-6:
+            index = next_index
+            if not loop and index >= len(points) - 1:
+                break
+            continue
+        bearing = haversine_bearing(start[0], start[1], end[0], end[1])
+        if remaining_nm <= leg_nm:
+            lat_value, lon_value = destination_from_bearing(start[0], start[1], bearing, remaining_nm)
+            return lat_value, lon_value, bearing, index, True
+        remaining_nm -= leg_nm
+        index = next_index
+        if not loop and index >= len(points) - 1:
+            break
+
+    last = points[-1]
+    previous = points[-2] if len(points) > 1 else last
+    bearing = haversine_bearing(previous[0], previous[1], last[0], last[1]) if previous != last else 0.0
+    return last[0], last[1], bearing, max(0, len(points) - 1), False
+
+
+def configure_ship_route(contact, route_config, now=None):
+    points = parse_route_waypoints(route_config.get("waypoints", route_config) if isinstance(route_config, dict) else route_config)
+    contact.route_waypoints = points
+    contact.route_index = 0
+    contact.route_active = False
+    contact.route_status = "No route"
+    if not points:
+        return False
+
+    route_source = route_config if isinstance(route_config, dict) else {}
+    speed_default = float(getattr(contact, "commanded_speed", getattr(contact, "speed", 0.0)) or getattr(contact, "speed", 0.0) or 0.0)
+    contact.route_speed_kts = max(0.0, float(route_source.get("speed", route_source.get("speed_kts", speed_default)) or 0.0))
+    contact.route_loop = bool(route_source.get("loop", route_source.get("route_loop", False)))
+    start_default = now if now is not None else time.time()
+    contact.route_started_at_utc = parse_route_timestamp(
+        route_source.get("started_at_utc", route_source.get("start_utc", route_source.get("started_at"))),
+        start_default
+    )
+    contact.route_active = len(points) > 1 and contact.route_speed_kts > 0.0
+    contact.route_manual_paused = False
+    contact.route_status = f"Route: {len(points)} WPT" if contact.route_active else "Route idle"
+    return True
+
+
+def apply_ship_route_elapsed_position(contact, now=None):
+    if getattr(contact, "internal_type", "") != "Surface-Ship" or not getattr(contact, "route_waypoints", None):
+        return False
+    if now is None:
+        now = time.time()
+    speed_kts = float(getattr(contact, "route_speed_kts", None) or getattr(contact, "speed", 0.0) or 0.0)
+    started_at = parse_route_timestamp(getattr(contact, "route_started_at_utc", None), now)
+    result = route_position_at_elapsed(
+        getattr(contact, "route_waypoints", []),
+        speed_kts,
+        now - started_at,
+        bool(getattr(contact, "route_loop", False))
+    )
+    if result is None:
+        return False
+    lat_value, lon_value, bearing, route_index, active = result
+    set_contact_latlon(contact, lat_value, lon_value)
+    contact.bearing = bearing % 360.0
+    contact.speed = speed_kts if active else 0.0
+    contact.commanded_heading = contact.bearing
+    contact.commanded_speed = contact.speed
+    contact.route_index = route_index
+    contact.route_active = bool(active)
+    contact.route_manual_paused = False
+    contact.route_status = f"Route WPT {route_index + 1}/{len(contact.route_waypoints)}" if active else "Route complete"
+    return True
+
+
+def update_ship_route_following(contact):
+    if getattr(contact, "internal_type", "") != "Surface-Ship" or not getattr(contact, "route_active", False):
+        return False
+    points = getattr(contact, "route_waypoints", [])
+    if len(points) < 2:
+        contact.route_active = False
+        contact.route_status = "No route"
+        return False
+    index = min(max(0, int(getattr(contact, "route_index", 0) or 0)), len(points) - 1)
+    next_index = (index + 1) % len(points)
+    if not getattr(contact, "route_loop", False) and index >= len(points) - 1:
+        contact.route_active = False
+        contact.commanded_speed = 0.0
+        contact.route_status = "Route complete"
+        return False
+    target_lat, target_lon = points[next_index]
+    distance_nm = haversine(contact.contact_lat, contact.contact_long, target_lat, target_lon)
+    if distance_nm <= ship_route_arrival_radius_nm:
+        contact.route_index = next_index
+        if not getattr(contact, "route_loop", False) and next_index >= len(points) - 1:
+            contact.route_active = False
+            contact.commanded_speed = 0.0
+            contact.route_status = "Route complete"
+            return False
+        next_index = (contact.route_index + 1) % len(points)
+        target_lat, target_lon = points[next_index]
+    contact.commanded_heading = haversine_bearing(contact.contact_lat, contact.contact_long, target_lat, target_lon)
+    contact.commanded_speed = max(0.0, float(getattr(contact, "route_speed_kts", getattr(contact, "speed", 0.0)) or 0.0))
+    contact.route_status = f"Route WPT {contact.route_index + 1}/{len(points)}"
+    return True
+
+
+
+def ship_route_config_from_saved_config(data):
+    if not isinstance(data, dict):
+        return None
+    route_config = data.get("route", data.get("ship_route"))
+    if route_config is not None:
+        return route_config
+    route_text = str(data.get("route_text", "") or "").strip()
+    if route_text:
+        waypoints = parse_route_waypoints(route_text)
+        if waypoints:
+            return {
+                "waypoints": waypoints,
+                "speed_kts": data.get("route_speed_kts", data.get("route_speed", data.get("speed"))),
+                "loop": data.get("route_loop", False),
+                "started_at_utc": data.get("route_started_at_utc", data.get("route_start_utc", data.get("route_started_at", time.time())))
+            }
+    waypoints = data.get("route_waypoints", data.get("waypoints"))
+    if waypoints is None:
+        return None
+    return {
+        "waypoints": waypoints,
+        "speed_kts": data.get("route_speed_kts", data.get("route_speed", data.get("speed"))),
+        "loop": data.get("route_loop", False),
+        "started_at_utc": data.get("route_started_at_utc", data.get("route_start_utc", data.get("route_started_at")))
+    }
+
+
+def route_text_from_saved_config(data):
+    if not isinstance(data, dict):
+        return ""
+    route_text = str(data.get("route_text", "") or "").strip()
+    if route_text:
+        return route_text
+    route_config = data.get("route", data.get("ship_route"))
+    if isinstance(route_config, dict):
+        waypoints = route_config.get("waypoints", [])
+    else:
+        waypoints = data.get("route_waypoints", data.get("waypoints", []))
+    formatted = []
+    for point in waypoints or []:
+        try:
+            lat_value = float(point.get("lat", point.get("latitude"))) if isinstance(point, dict) else float(point[0])
+            lon_value = float(point.get("lon", point.get("longitude"))) if isinstance(point, dict) else float(point[1])
+        except (TypeError, ValueError, IndexError, AttributeError):
+            continue
+        formatted.append(f"{lat_value:.5f},{lon_value:.5f}")
+    return " ".join(formatted)
+def ship_route_config_from_contact(contact):
+    points = getattr(contact, "route_waypoints", [])
+    if not points:
+        return None
+    return {
+        "waypoints": route_waypoints_to_config(points),
+        "speed_kts": float(getattr(contact, "route_speed_kts", getattr(contact, "speed", 0.0)) or 0.0),
+        "loop": bool(getattr(contact, "route_loop", False)),
+        "started_at_utc": route_timestamp_to_config(getattr(contact, "route_started_at_utc", None))
+    }
+
+def merge_live_contact_state_into_saved(saved_contact, contact):
+    if contact is None:
+        return saved_contact
+    saved_contact["classification_type"] = str(getattr(contact, "classification_type", "Unknown"))
+    saved_contact["classification_class"] = str(getattr(contact, "classification_class", "Unknown"))
+    saved_contact["identity_status"] = str(getattr(contact, "identity_status", "P"))
+    saved_contact["country"] = str(getattr(contact, "country", "Unknown"))
+    saved_contact["operator_classified"] = bool(getattr(contact, "operator_classified", False))
+    saved_contact["detected"] = bool(getattr(contact, "detected", False))
+    saved_contact["commanded_speed"] = float(getattr(contact, "commanded_speed", getattr(contact, "speed", 0.0)) or 0.0)
+    saved_contact["commanded_heading"] = float(getattr(contact, "commanded_heading", getattr(contact, "bearing", 0.0)) or 0.0) % 360.0
+    saved_contact["ship_underway_speed"] = float(getattr(contact, "ship_underway_speed", saved_contact["commanded_speed"]) or 0.0)
+    if getattr(contact, "route_speed_kts", None) is not None:
+        saved_contact["route_speed_kts"] = float(getattr(contact, "route_speed_kts", 0.0) or 0.0)
+    saved_contact["route_active"] = bool(getattr(contact, "route_active", False))
+    saved_contact["route_manual_paused"] = bool(getattr(contact, "route_manual_paused", False))
+    saved_contact["route_index"] = int(getattr(contact, "route_index", 0) or 0)
+    saved_contact["route_status"] = str(getattr(contact, "route_status", "No route"))
+    shadow_target = str(getattr(contact, "shadow_target_name", "") or "").strip()
+    if shadow_target:
+        saved_contact["shadow_target"] = shadow_target
+        saved_contact["shadow_distance_nm"] = float(getattr(contact, "shadow_distance_nm", 5.0) or 5.0)
+    return saved_contact
+
+
+def apply_saved_contact_state(contact, data):
+    if not isinstance(data, dict):
+        return contact
+    contact.classification_type = str(data.get("classification_type", getattr(contact, "classification_type", "Unknown")))
+    contact.classification_class = str(data.get("classification_class", getattr(contact, "classification_class", "Unknown")))
+    contact.identity_status = str(data.get("identity_status", getattr(contact, "identity_status", "P")))
+    contact.country = str(data.get("country", getattr(contact, "country", "Unknown")))
+    contact.operator_classified = bool(data.get("operator_classified", getattr(contact, "operator_classified", False)))
+    contact.detected = bool(data.get("detected", getattr(contact, "detected", False)))
+    contact.broadcasting = bool(data.get("broadcasting", getattr(contact, "broadcasting", False)))
+    contact.team = str(data.get("team", getattr(contact, "team", "Neutral")))
+    contact.shadow_target_name = shadow_target_name_from_saved_config(data)
+    contact.shadow_distance_nm = shadow_distance_from_saved_config(data)
+    if "commanded_speed" in data:
+        contact.commanded_speed = max(0.0, float(data.get("commanded_speed", 0.0) or 0.0))
+    if "commanded_heading" in data:
+        contact.commanded_heading = float(data.get("commanded_heading", getattr(contact, "bearing", 0.0)) or 0.0) % 360.0
+    if "ship_underway_speed" in data:
+        contact.ship_underway_speed = max(0.0, float(data.get("ship_underway_speed", 0.0) or 0.0))
+    if "route_speed_kts" in data and getattr(contact, "route_waypoints", None):
+        contact.route_speed_kts = max(0.0, float(data.get("route_speed_kts", 0.0) or 0.0))
+    if getattr(contact, "route_waypoints", None):
+        if "route_index" in data:
+            contact.route_index = max(0, min(int(data.get("route_index", 0) or 0), len(contact.route_waypoints) - 1))
+        if "route_active" in data:
+            contact.route_active = bool(data.get("route_active", getattr(contact, "route_active", False)))
+        contact.route_manual_paused = bool(data.get("route_manual_paused", getattr(contact, "route_manual_paused", False)))
+        contact.route_status = str(data.get("route_status", getattr(contact, "route_status", "No route")))
+    return contact
+
+
 def current_aircraft_latlon_for_search():
     return float(player_pos.x), float(player_pos.y)
+
+
+def player_is_surface_ship():
+    return dropdown_value(MULTIPLAYER_PLAYER_TYPE) == "Ship"
+
+
+def player_is_submarine():
+    return dropdown_value(MULTIPLAYER_PLAYER_TYPE) == "Submarine"
+
+
+def player_is_ship_or_sub():
+    return player_is_surface_ship() or player_is_submarine()
+
+
+def autosave_ship_route_to_config(contact):
+    route_config = ship_route_config_from_contact(contact)
+    if route_config is None:
+        return False
+    cfg_path = globals().get("config_path", "config.json")
+    try:
+        with open(cfg_path, "r") as f:
+            saved_config = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Ship route autosave failed: could not read config.json: {exc}")
+        return False
+
+    entries = saved_config.get("submarines", [])
+    contact_name = str(getattr(contact, "name", ""))
+    matched = None
+    for entry in entries:
+        if str(entry.get("name", "")) == contact_name:
+            matched = entry
+            break
+    if matched is None:
+        print(f"Ship route autosave skipped: no config entry named {contact_name}")
+        return False
+
+    matched["route"] = route_config
+    try:
+        with open(cfg_path, "w") as f:
+            json.dump(saved_config, f, indent=4)
+    except OSError as exc:
+        print(f"Ship route autosave failed: could not write config.json: {exc}")
+        return False
+    print(f"Ship route autosaved for {contact_name}")
+    return True
+def assign_ship_route_from_text(contact, route_text, loop=False):
+    if contact is None or getattr(contact, "internal_type", "") != "Surface-Ship":
+        print("Ship route ignored: select a surface ship contact first")
+        return False
+    imported = parse_route_waypoints(route_text)
+    if not imported:
+        print(f"Ship route ignored for track {getattr(contact, 'track_number', '?')}: no valid waypoints")
+        return False
+    current_point = (float(contact.contact_lat), float(contact.contact_long))
+    if haversine(current_point[0], current_point[1], imported[0][0], imported[0][1]) > ship_route_arrival_radius_nm:
+        imported = [current_point] + imported
+    speed_kts = max(
+        ship_default_underway_speed_kts,
+        float(getattr(contact, "commanded_speed", 0.0) or 0.0),
+        float(getattr(contact, "speed", 0.0) or 0.0),
+        float(getattr(contact, "route_speed_kts", 0.0) or 0.0)
+    )
+    route_config = {
+        "waypoints": imported,
+        "speed_kts": speed_kts,
+        "loop": loop,
+        "started_at_utc": time.time()
+    }
+    if configure_ship_route(contact, route_config):
+        target_index = min(1, len(imported) - 1)
+        contact.commanded_speed = speed_kts
+        contact.commanded_heading = haversine_bearing(
+            contact.contact_lat,
+            contact.contact_long,
+            imported[target_index][0],
+            imported[target_index][1]
+        )
+        print(f"Ship track {getattr(contact, 'track_number', '?')} assigned route with {len(imported)} waypoints at {speed_kts:.1f} kt")
+        autosave_ship_route_to_config(contact)
+        return True
+    return False
+
+def clamp_float(value, default, minimum=None, maximum=None):
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        result = float(default)
+    if minimum is not None:
+        result = max(float(minimum), result)
+    if maximum is not None:
+        result = min(float(maximum), result)
+    return result
+
+
+def update_nav_control_visibility():
+    visible = (display_mode == "NAV")
+    for element in nav_elements:
+        if visible:
+            element.show()
+        else:
+            element.hide()
+    if player_is_submarine():
+        nav_depth_label.show() if visible else nav_depth_label.hide()
+        nav_depth_entry.show() if visible else nav_depth_entry.hide()
+    else:
+        nav_depth_label.hide()
+        nav_depth_entry.hide()
+
+
+def apply_nav_command_entries(format_fields=True):
+    global ownship_commanded_heading, ownship_commanded_speed, ownship_commanded_depth
+    ownship_commanded_heading = clamp_float(nav_heading_entry.get_text(), ownship_commanded_heading, 0.0, 359.9) % 360
+    ownship_commanded_speed = clamp_float(nav_speed_entry.get_text(), ownship_commanded_speed, 0.0, 45.0 if player_is_surface_ship() else 35.0)
+    ownship_commanded_depth = clamp_float(nav_depth_entry.get_text(), ownship_commanded_depth, 0.0, 2000.0)
+    if not player_is_submarine():
+        ownship_commanded_depth = 0.0
+    if format_fields:
+        nav_heading_entry.set_text(f"{ownship_commanded_heading:03.0f}")
+        nav_speed_entry.set_text(f"{ownship_commanded_speed:.1f}")
+        nav_depth_entry.set_text(f"{ownship_commanded_depth:.0f}")
+
+
+def import_ownship_route_from_nav_entry():
+    global ownship_route_waypoints, ownship_route_index, ownship_route_active, ownship_route_status
+    imported = parse_navigraph_waypoints(nav_route_entry.get_text())
+    ownship_route_waypoints = [pygame.Vector2(point) for point in imported]
+    ownship_route_index = 0
+    ownship_route_active = bool(ownship_route_waypoints)
+    ownship_route_status = f"Route: {len(ownship_route_waypoints)} WPT" if ownship_route_active else "No valid route"
+    nav_route_status_label.set_text(ownship_route_status)
+
+
+def update_ship_sub_ownship(dt_seconds):
+    global lat, long, hdg, alt, ownship_current_heading, ownship_last_heading, ownship_heading_rate_dps
+    global ownship_current_speed, ownship_current_depth, ownship_commanded_heading, ownship_commanded_speed, ownship_commanded_depth, ownship_route_index, ownship_route_active, ownship_route_status
+    global ownship_control_initialized_track
+    contact = selected_ownship_control_contact()
+    if contact is None:
+        ownship_route_status = "No controllable contact"
+        nav_route_status_label.set_text(ownship_route_status)
+        return
+
+    lat = float(contact.contact_lat)
+    long = float(contact.contact_long)
+    selected_track = int(getattr(contact, "track_number", 0) or 0)
+    if ownship_control_initialized_track != selected_track:
+        ownship_control_initialized_track = selected_track
+        ownship_current_speed = float(getattr(contact, "speed", 0.0) or 0.0)
+        ownship_current_heading = float(getattr(contact, "bearing", ownship_current_heading) or ownship_current_heading) % 360
+        ownship_current_depth = float(getattr(contact, "depth", 0.0) or 0.0)
+        ownship_commanded_heading = ownship_current_heading
+        ownship_commanded_speed = ownship_current_speed
+        ownship_commanded_depth = ownship_current_depth if player_is_submarine() else 0.0
+        nav_heading_entry.set_text(f"{ownship_commanded_heading:03.0f}")
+        nav_speed_entry.set_text(f"{ownship_commanded_speed:.1f}")
+        nav_depth_entry.set_text(f"{ownship_commanded_depth:.0f}")
+
+    if ownship_route_active and ownship_route_index < len(ownship_route_waypoints):
+        target_world = ownship_route_waypoints[ownship_route_index]
+        target_lat, target_lon = pix_to_latlong(target_world.x, target_world.y)
+        distance_nm = haversine(lat, long, target_lat, target_lon)
+        if distance_nm <= max(0.05, ownship_current_speed / 720.0):
+            ownship_route_index += 1
+            if ownship_route_index >= len(ownship_route_waypoints):
+                ownship_route_active = False
+                ownship_route_status = "Route complete"
+                nav_route_status_label.set_text(ownship_route_status)
+            else:
+                target_world = ownship_route_waypoints[ownship_route_index]
+                target_lat, target_lon = pix_to_latlong(target_world.x, target_world.y)
+        if ownship_route_active:
+            ownship_commanded_heading = haversine_bearing(lat, long, target_lat, target_lon)
+            nav_heading_entry.set_text(f"{ownship_commanded_heading:03.0f}")
+
+    max_turn = (1.5 if player_is_surface_ship() else 1.0) * max(0.0, dt_seconds)
+    previous_heading = ownship_current_heading
+    ownship_current_heading = approach_bearing(ownship_current_heading, ownship_commanded_heading, max_turn)
+    if dt_seconds > 0:
+        delta = (ownship_current_heading - previous_heading + 180) % 360 - 180
+        ownship_heading_rate_dps = delta / dt_seconds
+    ownship_last_heading = previous_heading
+    ownship_current_speed = approach_value(ownship_current_speed, ownship_commanded_speed, (0.8 if player_is_surface_ship() else 0.5) * max(0.0, dt_seconds))
+    ownship_current_depth = approach_value(ownship_current_depth, ownship_commanded_depth if player_is_submarine() else 0.0, 35.0 * max(0.0, dt_seconds))
+
+    contact.bearing = ownship_current_heading
+    contact.speed = ownship_current_speed
+    contact.depth = ownship_current_depth if player_is_submarine() else 0.0
+    contact.detected = True
+    hdg = ownship_current_heading
+    alt = -ownship_current_depth if player_is_submarine() else 0.0
+
+def update_permanent_ownship_sonar():
+    if not player_is_ship_or_sub() or lat is None or long is None:
+        return
+    controlled = selected_ownship_control_contact()
+    sonar_range_nm = 14.0 if player_is_submarine() else 8.0
+    for contact in contacts:
+        if contact is controlled or is_dicass_ping_contact(contact):
+            continue
+        distance_nm = haversine(float(lat), float(long), contact.contact_lat, contact.contact_long)
+        if distance_nm <= sonar_range_nm:
+            contact.detected = True
+            contact.last_ownship_sonar_range_nm = distance_nm
+            contact.last_ownship_sonar_bearing = haversine_bearing(float(lat), float(long), contact.contact_lat, contact.contact_long)
+
+def draw_nav_display(surface):
+    surface.fill((2, 8, 14))
+    title_font = pygame.font.SysFont(None, scaled_font_size(28))
+    text_font = pygame.font.SysFont(None, scaled_font_size(22))
+    small_font = pygame.font.SysFont(None, scaled_font_size(18))
+    green = (80, 255, 160)
+    dim = (80, 120, 130)
+    white = (220, 240, 245)
+    amber = (255, 220, 120)
+    center = (surface.get_width() // 2, 540)
+    radius = 190
+
+    pygame.draw.circle(surface, dim, center, radius, 1)
+    for deg in range(0, 360, 30):
+        rad = math.radians(deg)
+        outer = (center[0] + math.sin(rad) * radius, center[1] - math.cos(rad) * radius)
+        inner = (center[0] + math.sin(rad) * (radius - 12), center[1] - math.cos(rad) * (radius - 12))
+        pygame.draw.line(surface, dim, outer, inner, 1)
+        label = small_font.render(f"{deg:03d}", True, white)
+        label_pos = (center[0] + math.sin(rad) * (radius + 24) - label.get_width() // 2, center[1] - math.cos(rad) * (radius + 24) - label.get_height() // 2)
+        surface.blit(label, label_pos)
+
+    heading_rad = math.radians(ownship_current_heading)
+    nose = (center[0] + math.sin(heading_rad) * (radius - 28), center[1] - math.cos(heading_rad) * (radius - 28))
+    pygame.draw.line(surface, green, center, nose, 4)
+    cmd_rad = math.radians(ownship_commanded_heading)
+    cmd = (center[0] + math.sin(cmd_rad) * (radius - 8), center[1] - math.cos(cmd_rad) * (radius - 8))
+    pygame.draw.line(surface, amber, center, cmd, 2)
+
+    zulu = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
+    mode = f"{dropdown_value(MULTIPLAYER_PLAYER_TYPE).upper()} {dropdown_value(MULTIPLAYER_TEAM).upper()}"
+    surface.blit(title_font.render(f"NAVIGATION  {mode}", True, green), (28, 28))
+    surface.blit(text_font.render(f"Zulu: {zulu}", True, white), (28, 62))
+    lines = [
+        f"Current heading: {ownship_current_heading:06.2f}",
+        f"Heading rate:    {ownship_heading_rate_dps:+.2f} deg/s",
+        f"Current speed:   {ownship_current_speed:.1f} kt",
+    ]
+    if player_is_submarine():
+        lines.append(f"Current depth:   {ownship_current_depth:.0f} ft")
+    for idx, line in enumerate(lines):
+        surface.blit(text_font.render(line, True, white), (28, 286 + idx * 30))
+
+    route_y = 785
+    if ownship_route_active and ownship_route_index < len(ownship_route_waypoints) and lat is not None and long is not None:
+        wpt = ownship_route_waypoints[ownship_route_index]
+        wpt_lat, wpt_lon = pix_to_latlong(wpt.x, wpt.y)
+        dist_nm = haversine(float(lat), float(long), wpt_lat, wpt_lon)
+        eta_min = (dist_nm / max(ownship_current_speed, 0.1)) * 60.0
+        bearing = haversine_bearing(float(lat), float(long), wpt_lat, wpt_lon)
+        route_lines = [
+            f"Waypoint {ownship_route_index + 1}/{len(ownship_route_waypoints)}  {latlon_to_navigraph(wpt_lat, wpt_lon)}",
+            f"Bearing {bearing:03.0f}  Distance {dist_nm:.2f} NM  ETA {eta_min:.1f} min",
+        ]
+    else:
+        route_lines = [ownship_route_status]
+    for idx, line in enumerate(route_lines):
+        surface.blit(text_font.render(line, True, amber), (28, route_y + idx * 30))
+
 
 
 def snap_search_anchor_latlon(lat_value, lon_value):
@@ -8877,6 +11514,8 @@ def multiplayer_host_packet():
         "id": MULTIPLAYER_ID,
         "callsign": MULTIPLAYER_CALLSIGN,
         "aircraft_type": MULTIPLAYER_AIRCRAFT_TYPE,
+        "role": multiplayer_role,
+        "password_required": multiplayer_role == "SERVER",
         "timestamp": time.time()
     }
 
@@ -8908,9 +11547,134 @@ def contact_to_mp(contact):
         "classification_class": str(getattr(contact, "classification_class", "Unknown")),
         "identity_status": str(getattr(contact, "identity_status", "P")),
         "operator_classified": bool(getattr(contact, "operator_classified", False)),
-        "tones": [tone_to_mp(tone) for tone in getattr(contact, "tones", [])]
+        "route": ship_route_config_from_contact(contact),
+        "route_index": int(getattr(contact, "route_index", 0) or 0),
+        "route_active": bool(getattr(contact, "route_active", False)),
+        "route_status": str(getattr(contact, "route_status", "No route")),
+        "tones": [tone_to_mp(tone) for tone in getattr(contact, "tones", [])],
+        "mp_source_id": str(getattr(contact, "mp_source_id", "")),
+        "mp_source_track": int(getattr(contact, "mp_source_track", getattr(contact, "track_number", 0)) or 0)
     }
 
+
+def contact_from_mp_item(item, preserve_track=True):
+    tones = [
+        Tone(
+            freq=float(tone.get("freq", 0.0)),
+            db=float(tone.get("db", 0.0)),
+            label=str(tone.get("label", "Tone")),
+            harmonics=int(tone.get("harmonics", 1)),
+            harmonic_drop=float(tone.get("harmonic_drop", 6.0))
+        )
+        for tone in item.get("tones", [])
+    ]
+    contact = Contact(
+        name=str(item.get("name", "Contact")),
+        tones=tones,
+        contact_lat=float(item.get("lat", 0.0)),
+        contact_long=float(item.get("lon", 0.0)),
+        speed=float(item.get("speed", 0.0)),
+        depth=float(item.get("depth", 0.0)),
+        bearing=float(item.get("bearing", 0.0))
+    )
+    if preserve_track:
+        contact.track_number = int(item.get("track_number", contact.track_number))
+    contact.detected = bool(item.get("detected", False))
+    contact.broadcasting = bool(item.get("broadcasting", False))
+    contact.internal_type = str(item.get("internal_type", "Unknown"))
+    contact.internal_class = str(item.get("internal_class", "Unknown"))
+    contact.classification_type = str(item.get("classification_type", "Unknown"))
+    contact.classification_class = str(item.get("classification_class", "Unknown"))
+    contact.identity_status = str(item.get("identity_status", "P"))
+    contact.operator_classified = bool(item.get("operator_classified", False))
+    contact.mp_source_id = str(item.get("mp_source_id", ""))
+    contact.mp_source_track = int(item.get("mp_source_track", item.get("track_number", contact.track_number)) or 0)
+    route_config = item.get("route")
+    if route_config is not None and configure_ship_route(contact, route_config, now=float(item.get("timestamp", time.time()) or time.time())):
+        contact.route_index = int(item.get("route_index", getattr(contact, "route_index", 0)) or 0)
+        contact.route_active = bool(item.get("route_active", getattr(contact, "route_active", False)))
+        contact.route_status = str(item.get("route_status", getattr(contact, "route_status", "No route")))
+    return contact
+
+
+def local_contacts_for_contribution():
+    return [
+        contact for contact in contacts
+        if hasattr(contact, "tones")
+        and not is_dicass_ping_contact(contact)
+        and not getattr(contact, "mp_from_server", False)
+    ]
+
+
+def multiplayer_contact_contribution_packet():
+    return {
+        "kind": "vASW-action",
+        "id": MULTIPLAYER_ID,
+        "action": "contacts",
+        "password": multiplayer_contact_password,
+        "callsign": MULTIPLAYER_CALLSIGN,
+        "timestamp": time.time(),
+        "contacts": [
+            dict(contact_to_mp(contact), mp_source_id=MULTIPLAYER_ID, mp_source_track=int(getattr(contact, "track_number", 0) or 0))
+            for contact in local_contacts_for_contribution()
+        ]
+    }
+
+
+def apply_multiplayer_contact_contribution(packet):
+    global multiplayer_last_state_broadcast
+    if not multiplayer_contact_password_ok(packet.get("password", "")):
+        print(f"[MP] contact contribution rejected from {packet.get('callsign', packet.get('id', 'MP'))}: bad password")
+        return
+
+    source_id = str(packet.get("id", ""))
+    updated = 0
+    created = 0
+    for item in packet.get("contacts", []):
+        try:
+            contact = contact_from_mp_item(item, preserve_track=False)
+            contact.mp_source_id = source_id
+            contact.mp_source_track = int(item.get("track_number", item.get("mp_source_track", 0)) or 0)
+            contact.mp_contributed = True
+            contact.mp_from_server = False
+        except (TypeError, ValueError):
+            continue
+
+        existing = next(
+            (
+                candidate for candidate in contacts
+                if str(getattr(candidate, "mp_source_id", "")) == source_id
+                and int(getattr(candidate, "mp_source_track", -1) or -1) == contact.mp_source_track
+            ),
+            None
+        )
+        if existing is None:
+            contacts.append(contact)
+            created += 1
+        else:
+            contact.track_number = existing.track_number
+            contacts[contacts.index(existing)] = contact
+            updated += 1
+
+    if created or updated:
+        multiplayer_last_state_broadcast = 0.0
+        print(f"[MP] accepted contact contribution from {packet.get('callsign', source_id)}: +{created}, updated {updated}")
+
+
+def send_multiplayer_contact_contribution():
+    if multiplayer_role != "JOIN" or multiplayer_host_seen is None or not multiplayer_contact_password_ok():
+        return False
+    if not local_contacts_for_contribution():
+        return False
+    sock = ensure_multiplayer_socket()
+    if sock is None:
+        return False
+    try:
+        sock.sendto(json.dumps(multiplayer_contact_contribution_packet()).encode("utf-8"), ("255.255.255.255", MULTIPLAYER_PORT))
+        return True
+    except OSError as exc:
+        print(f"[MP] contact contribution failed: {exc}")
+        return False
 
 def buoy_to_mp(buoy, kind):
     data = {
@@ -9043,7 +11807,7 @@ def update_multiplayer_channel_assignments():
         update_launch_channel_pool()
         return
 
-    if multiplayer_role == "HOST":
+    if multiplayer_is_host_role():
         participants = [{
             "id": MULTIPLAYER_ID,
             "callsign": MULTIPLAYER_CALLSIGN
@@ -9127,7 +11891,7 @@ def apply_multiplayer_launch_action(action):
     except (TypeError, ValueError):
         return
 
-    if multiplayer_role == "HOST" and selection in ("SSQ-53D(DIFAR)", "SSQ-62(DICASS)", "SSQ-36B(XBT)"):
+    if multiplayer_is_host_role() and selection in ("SSQ-53D(DIFAR)", "SSQ-62(DICASS)", "SSQ-36B(XBT)"):
         update_multiplayer_channel_assignments()
         requester_range = channel_range_for_player(str(action.get("id", "")))
         used_channels = deployed_sonobuoy_channels()
@@ -9202,8 +11966,96 @@ def current_player_lat_lon_for_mp():
     return None
 
 
+def contact_by_track_number(track_number):
+    try:
+        track_number = int(track_number)
+    except (TypeError, ValueError):
+        return None
+    for contact in contacts:
+        if int(getattr(contact, "track_number", -1) or -1) == track_number:
+            return contact
+    return None
+
+
+def apply_contact_command_to_contact(contact, command, payload):
+    global multiplayer_last_state_broadcast
+    if contact is None:
+        return False
+    command = str(command or "")
+
+    if command == "classify":
+        contact.operator_classified = True
+        if "classification_type" in payload:
+            contact.classification_type = str(payload.get("classification_type", "Unknown"))
+        if "classification_class" in payload:
+            contact.classification_class = str(payload.get("classification_class", "Unknown"))
+    elif command == "identity":
+        contact.operator_classified = True
+        contact.identity_status = str(payload.get("identity_status", getattr(contact, "identity_status", "P")))
+    elif command == "country":
+        contact.operator_classified = True
+        contact.country = str(payload.get("country", getattr(contact, "country", "Unknown")))
+    elif command == "lines":
+        contact.bearing_lines_hidden = bool(payload.get("bearing_lines_hidden", getattr(contact, "bearing_lines_hidden", False)))
+    elif command == "ship_stop":
+        request_ship_stop(contact)
+    elif command == "ship_heading":
+        request_ship_heading(contact, float(payload.get("heading", getattr(contact, "bearing", 0.0)) or 0.0))
+    elif command == "ship_speed":
+        request_ship_speed(contact, payload.get("speed", getattr(contact, "speed", 0.0)))
+    elif command == "ship_resume_route":
+        resume_ship_route(contact)
+    elif command == "ship_route_speed":
+        set_ship_route_speed(contact, payload.get("speed", getattr(contact, "route_speed_kts", getattr(contact, "speed", 0.0))))
+    elif command == "ship_route":
+        assign_ship_route_from_text(contact, str(payload.get("route_text", "")))
+    elif command == "deck_lock":
+        if selected_contact is contact:
+            toggle_ship_deck_lock(contact)
+        else:
+            ensure_ship_command_state(contact)
+            contact.manual_deck_lock_active = not bool(getattr(contact, "manual_deck_lock_active", False))
+    else:
+        return False
+
+    multiplayer_last_state_broadcast = 0.0
+    return True
+
+
+def send_multiplayer_contact_command(command, contact=None, **payload):
+    contact = contact or selected_contact
+    if multiplayer_role != "JOIN" or multiplayer_host_seen is None or contact is None:
+        return False
+    sock = ensure_multiplayer_socket()
+    if sock is None:
+        return False
+    packet = {
+        "kind": "vASW-action",
+        "id": MULTIPLAYER_ID,
+        "action": "contact_command",
+        "track_number": int(getattr(contact, "track_number", 0) or 0),
+        "command": command,
+        "payload": payload,
+        "timestamp": time.time()
+    }
+    try:
+        sock.sendto(json.dumps(packet).encode("utf-8"), ("255.255.255.255", MULTIPLAYER_PORT))
+        return True
+    except OSError as exc:
+        print(f"[MP] contact command failed: {exc}")
+        return False
+
+
+def apply_multiplayer_contact_command(packet):
+    contact = contact_by_track_number(packet.get("track_number"))
+    payload = packet.get("payload", {})
+    if not isinstance(payload, dict):
+        payload = {}
+    if apply_contact_command_to_contact(contact, packet.get("command"), payload):
+        print(f"[MP] applied contact command {packet.get('command')} for track {packet.get('track_number')}")
+
 def send_multiplayer_launch_request():
-    if multiplayer_role != "JOIN" or multiplayer_host_seen is None:
+    if multiplayer_role != "JOIN" or multiplayer_host_seen is None or not multiplayer_can_join_server():
         return False
     launch_latlon = current_player_lat_lon_for_mp()
     if launch_latlon is None:
@@ -9224,6 +12076,7 @@ def send_multiplayer_launch_request():
         "hdg": float(hdg or 0),
         "seeker_mode": selected_torpedo_mode,
         "target_frequency": float(selected_torpedo_frequency),
+        "password": multiplayer_contact_password,
         "timestamp": time.time()
     }
     try:
@@ -9298,6 +12151,14 @@ def apply_multiplayer_state(packet):
             contact.classification_class = str(item.get("classification_class", "Unknown"))
             contact.identity_status = str(item.get("identity_status", "P"))
             contact.operator_classified = bool(item.get("operator_classified", False))
+            route_config = item.get("route")
+            if route_config is not None and configure_ship_route(contact, route_config, now=float(item.get("timestamp", time.time()) or time.time())):
+                contact.route_index = int(item.get("route_index", getattr(contact, "route_index", 0)) or 0)
+                contact.route_active = bool(item.get("route_active", getattr(contact, "route_active", False)))
+                contact.route_status = str(item.get("route_status", getattr(contact, "route_status", "No route")))
+            contact.mp_from_server = True
+            contact.mp_source_id = str(item.get("mp_source_id", ""))
+            contact.mp_source_track = int(item.get("mp_source_track", item.get("track_number", contact.track_number)) or 0)
             rebuilt_contacts.append(contact)
         except (TypeError, ValueError):
             continue
@@ -9420,13 +12281,30 @@ def multiplayer_altitude_label(altitude_ft):
     return f"{altitude_ft:.0f}FT"
 
 
+def multiplayer_team_colour(team):
+    team = str(team or "").upper()
+    if team == "REDFOR":
+        return (255, 90, 90)
+    if team == "NEUTRAL":
+        return (240, 230, 120)
+    return (90, 170, 255)
+
+
 def multiplayer_aircraft_tag(peer):
     callsign = str(peer.get("callsign", "MP")).strip() or "MP"
+    player_type = str(peer.get("player_type", "Aircraft"))
     aircraft_type = str(peer.get("aircraft_type", "")).strip()
     parts = [callsign]
-    if aircraft_type and aircraft_type.lower() not in callsign.lower():
-        parts.append(aircraft_type)
-    parts.append(multiplayer_altitude_label(peer.get("alt", 0)))
+    if player_type == "Aircraft":
+        if aircraft_type and aircraft_type.lower() not in callsign.lower():
+            parts.append(aircraft_type)
+        parts.append(multiplayer_altitude_label(peer.get("alt", 0)))
+    else:
+        parts.append(player_type.upper())
+        parts.append(str(peer.get("team", "BLUFOR")).upper())
+        parts.append(f"{float(peer.get('speed', 0) or 0):.0f}KT")
+        if player_type == "Submarine":
+            parts.append(f"D{float(peer.get('depth', 0) or 0):.0f}")
     return " ".join(parts)
 
 
@@ -9442,21 +12320,26 @@ def close_multiplayer_socket():
 
 def multiplayer_packet():
     return {
-        "kind": "vASW-aircraft",
+        "kind": "vASW-peer",
         "id": MULTIPLAYER_ID,
         "role": multiplayer_role,
         "callsign": MULTIPLAYER_CALLSIGN,
         "aircraft_type": MULTIPLAYER_AIRCRAFT_TYPE,
+        "player_type": MULTIPLAYER_PLAYER_TYPE,
+        "team": MULTIPLAYER_TEAM,
         "lat": float(player_pos.x),
         "lon": float(player_pos.y),
         "hdg": float(hdg or 0),
         "alt": float(alt or 0),
+        "depth": float(ownship_current_depth if player_is_submarine() else 0.0),
+        "speed": float(ownship_current_speed if player_is_ship_or_sub() else aircraft_groundspeed_kt),
+        "password": multiplayer_contact_password,
         "timestamp": time.time()
     }
 
 
 def update_multiplayer():
-    global multiplayer_last_broadcast, multiplayer_last_host_broadcast, multiplayer_last_state_broadcast, multiplayer_host_seen
+    global multiplayer_last_broadcast, multiplayer_last_host_broadcast, multiplayer_last_state_broadcast, multiplayer_host_seen, multiplayer_last_contact_contribution
 
     if not multiplayer_enabled:
         return
@@ -9466,7 +12349,7 @@ def update_multiplayer():
         return
 
     now = time.time()
-    if multiplayer_role == "HOST" and now - multiplayer_last_host_broadcast >= MULTIPLAYER_BROADCAST_INTERVAL:
+    if multiplayer_is_host_role() and now - multiplayer_last_host_broadcast >= MULTIPLAYER_BROADCAST_INTERVAL:
         multiplayer_last_host_broadcast = now
         try:
             payload = json.dumps(multiplayer_host_packet()).encode("utf-8")
@@ -9475,7 +12358,7 @@ def update_multiplayer():
             print(f"[MP] host beacon failed: {exc}")
 
     can_send_aircraft = hasattr(player_pos, "x") and hasattr(player_pos, "y")
-    if multiplayer_role == "JOIN" and multiplayer_host_seen is None:
+    if multiplayer_role == "JOIN" and (multiplayer_host_seen is None or not multiplayer_can_join_server()):
         can_send_aircraft = False
 
     if can_send_aircraft and now - multiplayer_last_broadcast >= MULTIPLAYER_BROADCAST_INTERVAL:
@@ -9486,7 +12369,11 @@ def update_multiplayer():
         except OSError as exc:
             print(f"[MP] broadcast failed: {exc}")
 
-    if multiplayer_role == "HOST" and now - multiplayer_last_state_broadcast >= MULTIPLAYER_STATE_BROADCAST_INTERVAL:
+    if multiplayer_role == "JOIN" and multiplayer_can_join_server() and now - multiplayer_last_contact_contribution >= MULTIPLAYER_CONTACT_CONTRIBUTION_INTERVAL:
+        multiplayer_last_contact_contribution = now
+        send_multiplayer_contact_contribution()
+
+    if multiplayer_is_host_role() and now - multiplayer_last_state_broadcast >= MULTIPLAYER_STATE_BROADCAST_INTERVAL:
         multiplayer_last_state_broadcast = now
         try:
             payload = json.dumps(multiplayer_state_packet()).encode("utf-8")
@@ -9512,8 +12399,12 @@ def update_multiplayer():
             continue
 
         if packet.get("kind") == "vASW-action":
-            if multiplayer_role == "HOST" and packet.get("action") == "launch":
+            if multiplayer_is_host_role() and packet.get("action") == "launch":
                 apply_multiplayer_launch_action(packet)
+            elif multiplayer_is_host_role() and packet.get("action") == "contacts":
+                apply_multiplayer_contact_contribution(packet)
+            elif multiplayer_is_host_role() and packet.get("action") == "contact_command":
+                apply_multiplayer_contact_command(packet)
             continue
 
         if packet.get("kind") == "vASW-host" or packet.get("role") == "HOST":
@@ -9521,6 +12412,7 @@ def update_multiplayer():
                 "id": str(packet.get("id")),
                 "callsign": str(packet.get("callsign", "HOST")),
                 "aircraft_type": str(packet.get("aircraft_type", "ASW")),
+                "password_required": bool(packet.get("password_required", packet.get("role") == "SERVER")),
                 "addr": addr[0],
                 "last_seen": now
             }
@@ -9530,12 +12422,13 @@ def update_multiplayer():
                 print(f"[MP] host available: {host['callsign']} from {host['addr']}")
             sync_multiplayer_menu_status()
 
-        if packet.get("kind") != "vASW-aircraft":
+        if packet.get("kind") not in ("vASW-aircraft", "vASW-peer"):
             if (
                 packet.get("kind") == "vASW-state" and
                 multiplayer_role == "JOIN" and
                 multiplayer_host_seen is not None and
-                str(packet.get("id")) == str(multiplayer_host_seen.get("id"))
+                str(packet.get("id")) == str(multiplayer_host_seen.get("id")) and
+                multiplayer_can_join_server()
             ):
                 apply_multiplayer_state(packet)
             continue
@@ -9545,10 +12438,14 @@ def update_multiplayer():
                 "id": str(packet.get("id")),
                 "callsign": str(packet.get("callsign", "MP")),
                 "aircraft_type": str(packet.get("aircraft_type", "ASW")),
+                "player_type": str(packet.get("player_type", "Aircraft")),
+                "team": str(packet.get("team", "BLUFOR")),
                 "lat": float(packet["lat"]),
                 "lon": float(packet["lon"]),
                 "hdg": float(packet.get("hdg", 0)),
                 "alt": float(packet.get("alt", 0)),
+                "depth": float(packet.get("depth", 0)),
+                "speed": float(packet.get("speed", 0)),
                 "addr": addr[0],
                 "last_seen": now
             }
@@ -9558,8 +12455,8 @@ def update_multiplayer():
         first_seen = peer["id"] not in multiplayer_peers
         multiplayer_peers[peer["id"]] = peer
         if first_seen:
-            print(f"[MP] saw aircraft {peer['callsign']} from {peer['addr']}")
-            if multiplayer_role == "HOST":
+            print(f"[MP] saw {peer.get('player_type', 'Aircraft').lower()} {peer['callsign']} from {peer['addr']}")
+            if multiplayer_is_host_role():
                 update_multiplayer_channel_assignments()
                 multiplayer_last_state_broadcast = 0.0
 
@@ -9567,7 +12464,7 @@ def update_multiplayer():
         if now - peer.get("last_seen", 0) > MULTIPLAYER_STALE_SECONDS:
             print(f"[MP] lost aircraft {peer.get('callsign', peer_id)}")
             multiplayer_peers.pop(peer_id, None)
-            if multiplayer_role == "HOST":
+            if multiplayer_is_host_role():
                 update_multiplayer_channel_assignments()
                 multiplayer_last_state_broadcast = 0.0
 
@@ -9790,6 +12687,8 @@ def radar_contact_tag(contact):
     track_number = getattr(contact, "track_number", "")
     speed = float(getattr(contact, "speed", 0) or 0)
     contact_class = getattr(contact, "classification_class", "Unknown")
+    if contact_is_civilian_surface(contact):
+        contact_class = "Civilian"
 
     parts = [str(track_number), f"{speed:.0f}KT"]
     parts.append("UNK" if not contact_class or contact_class == "Unknown" else str(contact_class)[:3].upper())
@@ -10048,6 +12947,39 @@ def draw_radar_display(surface):
     draw_track_quality_matrix(surface)
 
 
+def draw_ship_routes(surface):
+    route_font = scaled_sys_font(11, bold=True)
+    for contact in contacts:
+        if getattr(contact, "internal_type", "") != "Surface-Ship":
+            continue
+        waypoints = getattr(contact, "route_waypoints", []) or []
+        if len(waypoints) < 2:
+            continue
+
+        points = []
+        for waypoint in waypoints:
+            try:
+                points.append(pygame.Vector2(map_layer.translate_point(waypoint)))
+            except Exception:
+                continue
+        if len(points) < 2:
+            continue
+
+        active = bool(getattr(contact, "route_active", False))
+        colour = (120, 230, 170) if active else (90, 125, 120)
+        dim_colour = (45, 80, 75)
+        pygame.draw.lines(surface, dim_colour, False, points, 5)
+        pygame.draw.lines(surface, colour, False, points, 2)
+
+        route_index = max(0, min(int(getattr(contact, "route_index", 0) or 0), len(points) - 1))
+        for index, point in enumerate(points):
+            radius = 5 if index == route_index and active else 3
+            pygame.draw.circle(surface, colour, point, radius, 1)
+            if index == route_index and active:
+                pygame.draw.circle(surface, (255, 235, 120), point, radius + 4, 1)
+                label = route_font.render(f"RTE {getattr(contact, 'track_number', '?')}", False, (255, 235, 120))
+                surface.blit(label, (point.x + 8, point.y - 8))
+
 def draw_contact_map_trails(surface):
     for contact in contacts:
         if not contact_is_radar_visible(contact):
@@ -10230,6 +13162,11 @@ for sub_conf in config["submarines"]:  # note plural "submarines"
         internal_class = resolve_submarine_class_selection("Random")
         contact_acoustic_class = internal_class
     broadcasting = bool(sub_conf.get("broadcasting", internal_type == "Surface-Ship"))
+    selected_model_library = normalize_model_library(sub_conf.get("model_library", MODEL_LIBRARY_AUTO))
+    selected_model = str(sub_conf.get("model", "Auto") or "Auto")
+    contact_team = sub_conf.get("team", "Neutral")
+    if contact_team not in CONTACT_TEAM_OPTIONS:
+        contact_team = "Neutral"
     if internal_type == "Sub-surface":
         SubClass = sub_classes.get(contact_acoustic_class, AkulaSubmarine)  # get the correct subclass
         submarine = SubClass(
@@ -10261,8 +13198,6 @@ for sub_conf in config["submarines"]:  # note plural "submarines"
         )
         submarine.internal_type = internal_type
         submarine.internal_class = internal_class
-        gaist_model_title_for_contact(submarine)
-        apply_surface_ship_acoustic_profile(submarine)
     elif internal_type == "Biological":
         if internal_class == "Whale":
             submarine = make_whale_contact(
@@ -10295,13 +13230,43 @@ for sub_conf in config["submarines"]:  # note plural "submarines"
         )
     submarine.internal_type = internal_type
     submarine.internal_class = internal_class
+    submarine.model_library = selected_model_library
+    if selected_model != "Auto":
+        submarine.gaist_model_title = selected_model
+    elif internal_type == "Surface-Ship":
+        submarine.gaist_model_title = ""
+        gaist_model_title_for_contact(submarine)
+    if internal_type == "Surface-Ship":
+        apply_surface_ship_acoustic_profile(submarine)
     submarine.broadcasting = broadcasting
+    submarine.team = contact_team
+    route_config = ship_route_config_from_saved_config(sub_conf)
+    if route_config is not None and configure_ship_route(submarine, route_config):
+        apply_ship_route_elapsed_position(submarine)
+    apply_saved_contact_state(submarine, sub_conf)
     contacts.append(submarine)
+
+update_all_contact_shadow_following()
 
 # Now `contacts` contains all submarines from the config
 # Example access:
 
 
+
+
+if DEDICATED_HOST_MODE:
+    multiplayer_role = "SERVER"
+    multiplayer_enabled = True
+    multiplayer_contact_password = MULTIPLAYER_CONTACT_PASSWORD
+    MULTIPLAYER_CALLSIGN = os.environ.get("VASW_HOST_CALLSIGN", "VASW-SERVER")[:12]
+    MULTIPLAYER_PLAYER_TYPE = "Aircraft"
+    MULTIPLAYER_TEAM = "Neutral"
+    ensure_multiplayer_socket()
+    try:
+        pygame.display.set_caption("vASW Server")
+    except Exception:
+        pass
+    print(f"[SERVER] Dedicated vASW server running as {MULTIPLAYER_CALLSIGN} on UDP {MULTIPLAYER_PORT}")
 
 # ---------------------------------------------------------------------------
 # Main loop
@@ -10329,54 +13294,59 @@ while running:
 
 
 
-    # Refresh the live aircraft position. X-Plane writes a JSON file, so throttle
-    # disk reads to avoid doing file I/O 60 times per second.
-    if xplane == 1:
-        now = time.time()
-        if now - last_xplane_read_time >= xplane_read_interval:
-            last_xplane_read_time = now
-            try:
-                if os.path.getsize(json_path) > 0:
-                    with open(json_path, 'r') as f:
-                        last_xplane_data = json.load(f)
-            except (OSError, json.JSONDecodeError):
-                # The simulator may be writing the file at this exact moment.
-                # Keep using the last good position instead of stalling the UI.
-                pass
+    if not player_is_ship_or_sub():
+        # Refresh the live aircraft position. X-Plane writes a JSON file, so throttle
+        # disk reads to avoid doing file I/O 60 times per second.
+        if xplane == 1:
+            now = time.time()
+            if now - last_xplane_read_time >= xplane_read_interval:
+                last_xplane_read_time = now
+                try:
+                    if os.path.getsize(json_path) > 0:
+                        with open(json_path, 'r') as f:
+                            last_xplane_data = json.load(f)
+                except (OSError, json.JSONDecodeError):
+                    # The simulator may be writing the file at this exact moment.
+                    # Keep using the last good position instead of stalling the UI.
+                    pass
 
-        if last_xplane_data is not None:
-            lat = last_xplane_data["latitude"]
-            long = last_xplane_data["longitude"]
-            alt = last_xplane_data["altitude_ft"]
-            hdg = last_xplane_data["heading_true"]
+            if last_xplane_data is not None:
+                lat = last_xplane_data["latitude"]
+                long = last_xplane_data["longitude"]
+                alt = last_xplane_data["altitude_ft"]
+                hdg = last_xplane_data["heading_true"]
+        else:
+            if aq:
+                sim_lat = aq.get("PLANE_LATITUDE")
+                sim_long = aq.get("PLANE_LONGITUDE")
+                sim_hdg = aq.get("PLANE_HEADING_DEGREES_TRUE")
+                sim_alt = aq.get("INDICATED_ALTITUDE")
+                sim_plane_alt = aq.get("PLANE_ALTITUDE")
+                sim_groundspeed = aq.get("GROUND_VELOCITY")
+                if sim_lat is not None and sim_long is not None:
+                    lat = sim_lat
+                    long = sim_long
+                if sim_alt is not None:
+                    alt = sim_alt
+                if sim_plane_alt is not None:
+                    plane_altitude_ft = sim_plane_alt
+                if sim_groundspeed is not None:
+                    aircraft_groundspeed_kt = sim_groundspeed
+                if sim_hdg is not None:
+                    hdg = math.degrees(sim_hdg)
+
+
+
+
+
+
+
+
+
+
+
     else:
-        if aq:
-            sim_lat = aq.get("PLANE_LATITUDE")
-            sim_long = aq.get("PLANE_LONGITUDE")
-            sim_hdg = aq.get("PLANE_HEADING_DEGREES_TRUE")
-            sim_alt = aq.get("INDICATED_ALTITUDE")
-            sim_plane_alt = aq.get("PLANE_ALTITUDE")
-            sim_groundspeed = aq.get("GROUND_VELOCITY")
-            if sim_lat is not None and sim_long is not None:
-                lat = sim_lat
-                long = sim_long
-            if sim_alt is not None:
-                alt = sim_alt
-            if sim_plane_alt is not None:
-                plane_altitude_ft = sim_plane_alt
-            if sim_groundspeed is not None:
-                aircraft_groundspeed_kt = sim_groundspeed
-            if sim_hdg is not None:
-                hdg = math.degrees(sim_hdg)
-
-
-
-
-
-
-
-
-
+        update_ship_sub_ownship(dt)
 
     if not update_check_started and time.time() >= update_check_start_time:
         start_background_update_check()
@@ -10393,6 +13363,7 @@ while running:
             refresh_resolution_dependent_fonts()
             resize_ui(screen_width, screen_height)
             layout_top_mode_buttons(screen_width, screen_height)
+            sync_stateful_button_styles()
             radar_terrain_cache["key"] = None
         elif event.type == pygame.KEYDOWN:
             if event.key == pygame.K_c and not point_over_visible_ui(pygame.mouse.get_pos()):
@@ -10410,6 +13381,11 @@ while running:
 
         if event.type == pygame.MOUSEBUTTONDOWN:
             handled_search_pattern_chord = False
+            if event.button == 1 and in_menu:
+                for row in contact_define_row_array:
+                    if not getattr(row, "model_dropdown_has_full_options", True) and row.model_dropdown.rect.collidepoint(event.pos):
+                        row.ensure_full_model_dropdown()
+                        break
             if event.button == 1 and not in_menu:
                 for slot in spectrogram_slot_array:
                     if slot.handle_narrowband_drag_start(event.pos):
@@ -10617,6 +13593,14 @@ while running:
 
 
 
+        if hasattr(pygame_gui, "UI_TEXT_ENTRY_CHANGED") and event.type == pygame_gui.UI_TEXT_ENTRY_CHANGED:
+            if event.ui_element in (nav_heading_entry, nav_speed_entry, nav_depth_entry):
+                if event.ui_element == nav_heading_entry:
+                    ownship_route_active = False
+                    ownship_route_status = "Manual heading"
+                    nav_route_status_label.set_text(ownship_route_status)
+                apply_nav_command_entries(format_fields=False)
+
         if event.type == pygame_gui.UI_TEXT_ENTRY_FINISHED:
             for row in contact_define_row_array:
 
@@ -10709,6 +13693,11 @@ while running:
                     except:
                         row.sub_bearing_textbox.set_text("")
 
+                if event.ui_element == row.route_textbox:
+                    row.route_text_entered = row.route_textbox.get_text().strip()
+                if event.ui_element == row.shadow_target_textbox:
+                    row.shadow_target_entered = row.shadow_target_textbox.get_text().strip()
+
             if event.ui_element in (search_pattern_datum_lat_entry, search_pattern_datum_lon_entry):
                 apply_typed_search_datum()
             if event.ui_element in (
@@ -10723,6 +13712,46 @@ while running:
                 apply_search_offset_from_aircraft()
             if event.ui_element == search_pattern_import_entry:
                 import_search_pattern_waypoints()
+            if event.ui_element in (nav_heading_entry, nav_speed_entry, nav_depth_entry):
+                if event.ui_element == nav_heading_entry:
+                    ownship_route_active = False
+                    ownship_route_status = "Manual heading"
+                    nav_route_status_label.set_text(ownship_route_status)
+                apply_nav_command_entries()
+            if event.ui_element == ship_heading_entry and selected_contact_is_surface_ship():
+                heading_text = ship_heading_entry.get_text().strip()
+                requested_heading = float(heading_text) if heading_text else current_aircraft_heading_deg(getattr(selected_contact, "bearing", 0))
+                request_ship_heading(selected_contact, requested_heading)
+                send_multiplayer_contact_command("ship_heading", selected_contact, heading=requested_heading)
+                sync_ship_command_controls(update_heading_text=True)
+                update_contact_context_panel()
+            if event.ui_element == ship_speed_entry and selected_contact_is_surface_ship():
+                speed_text = ship_speed_entry.get_text().strip()
+                request_ship_speed(selected_contact, speed_text)
+                send_multiplayer_contact_command("ship_speed", selected_contact, speed=speed_text)
+                sync_ship_command_controls(update_heading_text=True)
+                update_contact_context_panel()
+            if event.ui_element == ship_route_speed_entry and selected_contact_is_surface_ship():
+                route_speed_text = ship_route_speed_entry.get_text().strip()
+                set_ship_route_speed(selected_contact, route_speed_text)
+                send_multiplayer_contact_command("ship_route_speed", selected_contact, speed=route_speed_text)
+                sync_ship_command_controls(update_heading_text=True)
+                update_contact_context_panel()
+            if event.ui_element == contact_route_entry:
+                if selected_contact_is_friendly_surface_ship():
+                    route_text = contact_route_entry.get_text()
+                    assign_ship_route_from_text(selected_contact, route_text)
+                    send_multiplayer_contact_command("ship_route", selected_contact, route_text=route_text)
+                    update_contact_context_panel()
+            if event.ui_element == nav_route_entry:
+                if selected_contact_is_surface_ship():
+                    assign_ship_route_from_text(selected_contact, nav_route_entry.get_text())
+                    update_contact_context_panel()
+                else:
+                    import_ownship_route_from_nav_entry()
+            if event.ui_element == multiplayer_password_entry:
+                update_multiplayer_settings_from_menu()
+                sync_multiplayer_menu_status()
             if event.ui_element == multiplayer_callsign_entry:
                 update_multiplayer_settings_from_menu()
                 sync_multiplayer_menu_status()
@@ -10736,13 +13765,29 @@ while running:
 
         if event.type == pygame_gui.UI_DROP_DOWN_MENU_CHANGED:
             if event.ui_element == multiplayer_role_dropdown:
-                set_multiplayer_role(event.text)
+                set_multiplayer_role(dropdown_value(event.text))
                 sync_settings_fields()
             if event.ui_element == multiplayer_aircraft_dropdown:
-                MULTIPLAYER_AIRCRAFT_TYPE = event.text
+                MULTIPLAYER_AIRCRAFT_TYPE = dropdown_value(event.text)
                 update_multiplayer_settings_from_menu()
                 sync_multiplayer_menu_status()
                 sync_settings_fields()
+            if event.ui_element == multiplayer_player_type_dropdown:
+                MULTIPLAYER_PLAYER_TYPE = dropdown_value(event.text)
+                refresh_control_contact_dropdown("Auto")
+                update_multiplayer_platform_selector_visibility()
+                update_multiplayer_settings_from_menu()
+                sync_multiplayer_menu_status()
+                update_nav_control_visibility()
+            if event.ui_element == multiplayer_team_dropdown:
+                MULTIPLAYER_TEAM = dropdown_value(event.text)
+                update_multiplayer_settings_from_menu()
+                sync_multiplayer_menu_status()
+            if event.ui_element == multiplayer_contact_dropdown:
+                ownship_control_contact_key = dropdown_value(event.text)
+                ownship_control_contact_track = selected_control_contact_track_from_label(ownship_control_contact_key)
+                update_multiplayer_settings_from_menu()
+                sync_multiplayer_menu_status()
             if event.ui_element == settings_resolution_dropdown:
                 apply_resolution_option(event.text)
             if event.ui_element == settings_sound_dropdown:
@@ -10751,23 +13796,30 @@ while running:
                 set_simulator_mode(event.text)
                 sync_settings_fields()
             if event.ui_element == settings_aircraft_dropdown:
-                MULTIPLAYER_AIRCRAFT_TYPE = event.text
+                MULTIPLAYER_AIRCRAFT_TYPE = dropdown_value(event.text)
                 multiplayer_aircraft_dropdown.selected_option = event.text
                 sync_multiplayer_menu_status()
                 sync_settings_fields()
             for row in contact_define_row_array:
                 if event.ui_element == row.internal_type_dropdown:
-                    row.set_internal_type(event.text)
+                    row.set_internal_type(dropdown_value(event.text))
                 if event.ui_element == row.internal_class_dropdown:
-                    row.internal_class_entered = event.text
+                    selected_class = dropdown_value(event.text)
+                    row.internal_class_entered = selected_class
                     row.internal_class_label.set_text('<font color="#99C979">Class</font>')
                     if row.internal_type_entered == "Sub-surface":
-                        row.class_entered = event.text
+                        row.class_entered = selected_class
                     else:
                         row.class_entered = ""
                     row.refresh_model_dropdown("Auto")
+                    row.update_route_visibility()
+                if event.ui_element == row.team_dropdown:
+                    row.set_team(dropdown_value(event.text))
+                if event.ui_element == row.model_library_dropdown:
+                    row.set_model_library(dropdown_value(event.text))
                 if event.ui_element == row.model_dropdown:
-                    row.set_model(event.text)
+                    row.ensure_full_model_dropdown()
+                    row.set_model(dropdown_value(event.text))
 
         if event.type == pygame_gui.UI_BUTTON_PRESSED:
             if event.ui_element == settings_button:
@@ -10781,9 +13833,12 @@ while running:
                 check_and_install_update()
             if event.ui_element == update_popup_later_button:
                 set_update_popup_visible(False)
-            for row in contact_define_row_array:
+            for row in list(contact_define_row_array):
                 if event.ui_element == row.broadcasting_checkbox:
                     row.set_broadcasting(not row.broadcasting_entered)
+                if event.ui_element == row.delete_contact_button:
+                    delete_contact_define_row(row, delete_live=True)
+                    continue
                 
                 if event.ui_element == row.define_contact_button:
                     print(row.name_entered, row.lat_entered, row.long_entered, row.range_entered, row.class_entered, row.speed_entered, row.depth_entered, row.bearing_entered)
@@ -10812,6 +13867,10 @@ while running:
                         new_contact.internal_type = row.internal_type_entered
                         new_contact.internal_class = resolved_internal_class
                         new_contact.broadcasting = row.broadcasting_entered
+                        new_contact.team = row.team_entered
+                        new_contact.shadow_target_name = row.shadow_target_textbox.get_text().strip()
+                        new_contact.shadow_distance_nm = 5.0
+                        new_contact.model_library = row.selected_model_library
                         if row.selected_model != "Auto":
                             new_contact.gaist_model_title = row.selected_model
 
@@ -10850,8 +13909,17 @@ while running:
                             new_contact.operator_classified = True
                             new_contact.detected = False
 
+                        row.route_text_entered = row.route_textbox.get_text().strip()
+                        row.shadow_target_entered = row.shadow_target_textbox.get_text().strip()
+                        new_contact.shadow_target_name = row.shadow_target_entered
+                        new_contact.shadow_distance_nm = 5.0
+                        if row.is_route_enabled() and row.route_text_entered:
+                            assign_ship_route_from_text(new_contact, row.route_text_entered)
 
                         contacts.append(new_contact)
+                        if multiplayer_role == "JOIN" and multiplayer_contact_password_ok():
+                            send_multiplayer_contact_contribution()
+                        update_all_contact_shadow_following()
                         print(
                             f"Added contact: {new_contact.name}, Track #{new_contact.track_number}, "
                             f"Tones: {len(new_contact.tones)}, spawned {haversine(row.lat_entered, row.long_entered, spawn_lat, spawn_lon):.2f} NM from requested point"
@@ -10876,8 +13944,16 @@ while running:
         if event.type == pygame_gui.UI_BUTTON_PRESSED: # menu simulator button
             if event.ui_element == map_mode_button:
                 display_mode = "MAP"
+                update_nav_control_visibility()
+                sync_display_mode_control_visibility()
             if event.ui_element == radar_mode_button:
                 display_mode = "RADAR"
+                update_nav_control_visibility()
+                sync_display_mode_control_visibility()
+            if event.ui_element == nav_mode_button:
+                display_mode = "NAV"
+                update_nav_control_visibility()
+                sync_display_mode_control_visibility()
             if event.ui_element == radar_orientation_button:
                 radar_orientation = "NORTH" if radar_orientation == "TRACK" else "TRACK"
                 radar_orientation_button.set_text("NORTH UP" if radar_orientation == "NORTH" else "TRACK UP")
@@ -10899,6 +13975,8 @@ while running:
                 contact_context_user_closed = True
                 contact_context_panel.hide()
                 torpedo_designate_button.hide()
+                hide_ship_command_controls()
+                contact_delete_button.hide()
                 contact_context_close_button.hide()
                 contact_type_dropdown.hide()
                 contact_class_dropdown.hide()
@@ -10922,15 +14000,11 @@ while running:
                 begin_ray_trace_selection()
             if event.ui_element == xbt_raytrace_clear_button:
                 clear_ray_trace()
+            if event.ui_element == contact_delete_button:
+                continue
             if event.ui_element == contact_context_close_button:
                 contact_context_user_closed = True
-                contact_context_panel.hide()
-                torpedo_designate_button.hide()
-                contact_context_close_button.hide()
-                contact_type_dropdown.hide()
-                contact_class_dropdown.hide()
-                contact_status_dropdown.hide()
-                contact_country_dropdown.hide()
+                hide_contact_context_controls()
             if event.ui_element == search_pattern_generate_button:
                 generate_search_pattern()
             if event.ui_element == search_pattern_auto_buoy_button:
@@ -10941,6 +14015,12 @@ while running:
                 copy_search_pattern_waypoints()
             if event.ui_element == search_pattern_import_button:
                 import_search_pattern_waypoints()
+            if event.ui_element == nav_import_route_button:
+                if selected_contact_is_surface_ship():
+                    assign_ship_route_from_text(selected_contact, nav_route_entry.get_text())
+                    update_contact_context_panel()
+                else:
+                    import_ownship_route_from_nav_entry()
             if event.ui_element == search_pattern_close_button:
                 set_search_pattern_panel_visible(False)
             if event.ui_element == search_pattern_apply_datum_button:
@@ -10958,12 +14038,15 @@ while running:
                     "xplane": xplane,
                     "submarines": []
                 }
+                if isinstance(config, dict) and "aishub" in config:
+                    saved_config["aishub"] = config["aishub"]
 
                 for row in contact_define_row_array:
+                    row.update_from_textboxes()
                     # Only save rows with a valid name and class
                     if row.name_entered and row.internal_type_entered and row.internal_class_entered:
                         acoustic_class = row.internal_class_entered if row.internal_type_entered == "Sub-surface" else "Akula"
-                        saved_config["submarines"].append({
+                        saved_contact = {
                             "name": row.name_entered,
                             "latitude": row.lat_entered,
                             "longitude": row.long_entered,
@@ -10975,8 +14058,38 @@ while running:
                             "internal_type": row.internal_type_entered,
                             "internal_class": row.internal_class_entered,
                             "broadcasting": row.broadcasting_entered,
+                            "team": row.team_entered,
+                            "shadow_target": row.shadow_target_entered,
+                            "shadow_distance_nm": 5.0,
+                            "model_library": row.selected_model_library,
                             "model": row.selected_model
-                        })
+                        }
+                        row.route_text_entered = row.route_textbox.get_text().strip()
+                        row.shadow_target_entered = row.shadow_target_textbox.get_text().strip()
+                        if row.shadow_target_entered:
+                            saved_contact["shadow_target"] = row.shadow_target_entered
+                            saved_contact["shadow_distance_nm"] = 5.0
+                        else:
+                            saved_contact.pop("shadow_target", None)
+                            saved_contact.pop("shadow_distance_nm", None)
+                        if row.is_route_enabled() and row.route_text_entered:
+                            saved_contact["route_text"] = row.route_text_entered
+                        live_contact = next((contact for contact in contacts if getattr(contact, "name", None) == row.name_entered), None)
+                        merge_live_contact_state_into_saved(saved_contact, live_contact)
+                        if row.shadow_target_entered:
+                            saved_contact["shadow_target"] = row.shadow_target_entered
+                            saved_contact["shadow_distance_nm"] = 5.0
+                        else:
+                            saved_contact.pop("shadow_target", None)
+                            saved_contact.pop("shadow_distance_nm", None)
+                        route_config = ship_route_config_from_contact(live_contact) if live_contact is not None else None
+                        if route_config is not None:
+                            saved_contact["route"] = route_config
+                        elif row.is_route_enabled() and row.route_text_entered:
+                            route_config = ship_route_config_from_saved_config(saved_contact)
+                            if route_config is not None:
+                                saved_contact["route"] = route_config
+                        saved_config["submarines"].append(saved_contact)
 
                 with open("config.json", "w") as f:
                     json.dump(saved_config, f, indent=4)
@@ -11006,6 +14119,12 @@ while running:
                         internal_class = resolve_submarine_class_selection("Random")
                         contact_acoustic_class = internal_class
                     broadcasting = bool(sub_conf.get("broadcasting", internal_type == "Surface-Ship"))
+                    contact_team = sub_conf.get("team", "Neutral")
+                    if contact_team not in CONTACT_TEAM_OPTIONS:
+                        contact_team = "Neutral"
+                    shadow_target = shadow_target_name_from_saved_config(sub_conf)
+                    shadow_distance_nm = shadow_distance_from_saved_config(sub_conf)
+                    selected_model_library = normalize_model_library(sub_conf.get("model_library", MODEL_LIBRARY_AUTO))
                     selected_model = str(sub_conf.get("model", "Auto") or "Auto")
                     spawn_lat, spawn_lon = random_point_within_range_nm(
                         sub_conf["latitude"],
@@ -11077,9 +14196,21 @@ while running:
                         )
                     submarine.internal_type = internal_type
                     submarine.internal_class = internal_class
+                    submarine.model_library = selected_model_library
                     if selected_model != "Auto":
                         submarine.gaist_model_title = selected_model
+                    elif internal_type == "Surface-Ship":
+                        submarine.gaist_model_title = ""
+                        gaist_model_title_for_contact(submarine)
+                        apply_surface_ship_acoustic_profile(submarine)
                     submarine.broadcasting = broadcasting
+                    submarine.team = contact_team
+                    submarine.shadow_target_name = shadow_target
+                    submarine.shadow_distance_nm = shadow_distance_nm
+                    route_config = ship_route_config_from_saved_config(sub_conf)
+                    if route_config is not None and configure_ship_route(submarine, route_config):
+                        apply_ship_route_elapsed_position(submarine)
+                    apply_saved_contact_state(submarine, sub_conf)
                     contacts.append(submarine)
 
                     if contact_define_row_array:
@@ -11090,20 +14221,28 @@ while running:
                     new_row = ContactDefineRow(y=0, manager=manager, container=contact_define_container)
                     new_row.row_panel.set_relative_position((new_x, 10))  # position next to last row
                     contact_define_row_array.append(new_row)
-                    update_contact_define_scroll_area()
 
                     # Populate the row's textboxes
                     new_row.contact_name_textbox.set_text(sub_conf["name"])
                     new_row.sub_lat_textbox.set_text(str(sub_conf["latitude"]))
                     new_row.sub_long_textbox.set_text(str(sub_conf["longitude"]))
                     new_row.sub_range_textbox.set_text(f"{normalized_range_nm(sub_conf.get('range', 0)):.1f}")
-                    new_row.set_internal_type(internal_type, internal_class, selected_model)
+                    new_row.set_internal_type(internal_type, internal_class, selected_model, refresh_model=False)
+                    new_row.set_model_library(selected_model_library, selected_model, full_model_options=False)
                     new_row.set_broadcasting(broadcasting)
+                    new_row.set_team(contact_team)
+                    new_row.shadow_target_textbox.set_text(shadow_target)
+                    new_row.shadow_target_entered = shadow_target
+                    new_row.shadow_distance_nm_entered = shadow_distance_nm
                     new_row.sub_speed_textbox.set_text(str(int(sub_conf["speed"])))
                     new_row.sub_bearing_textbox.set_text(str(int(sub_conf["bearing"])))
                     new_row.sub_depth_textbox.set_text(str(int(sub_conf["depth"])))
+                    new_row.route_textbox.set_text(route_text_from_saved_config(sub_conf))
                     new_row.update_from_textboxes()
+                    new_row.update_route_visibility()
 
+                update_all_contact_shadow_following()
+                update_contact_define_scroll_area()
 
             if event.ui_element == start_button:
                 update_multiplayer_settings_from_menu()
@@ -11111,9 +14250,13 @@ while running:
                     print("[MP] cannot start as JOIN: no host detected. Start one instance as HOST first.")
                     sync_multiplayer_menu_status()
                     continue
-                if multiplayer_role == "HOST":
+                draw_start_loading_progress(0.08, "Checking multiplayer")
+                if multiplayer_is_host_role():
+                    draw_start_loading_progress(0.18, "Starting multiplayer server")
                     ensure_multiplayer_socket()
-                for row in contact_define_row_array:
+                total_contact_rows = max(1, len(contact_define_row_array))
+                for row_index, row in enumerate(contact_define_row_array):
+                    draw_start_loading_progress(0.24 + 0.18 * ((row_index + 1) / total_contact_rows), "Preparing contacts")
                     bearing_text = row.sub_bearing_textbox.get_text()
                     if bearing_text:
                         submarine_bearing = float( row.sub_bearing_textbox.get_text())
@@ -11127,6 +14270,8 @@ while running:
                         submarine_speed = random.uniform(2.0, 25.0)   
                     class_text = row.internal_class_entered if row.internal_type_entered == "Sub-surface" else ""
 
+                draw_start_loading_progress(0.44, "Resolving mission setup")
+
                 # Resolve class
                 if not class_text or str(class_text).lower() == "random":
                     submarine_class = resolve_submarine_class_selection("Random")
@@ -11137,9 +14282,10 @@ while running:
 
 
                 state = STATE_GAME
-                start_game()
+                start_game(draw_start_loading_progress)
                 in_menu = False
                 set_menu_visible(False)
+                draw_start_loading_progress(1.0, "Ready")
 
             if event.ui_element == civilian_traffic_button:
                 generate_dynamic_civilian_traffic()
@@ -11170,15 +14316,7 @@ while running:
                             # Toggle the range circle
                             matching_sono.range_circle = not matching_sono.range_circle
 
-                            # Update button colour based on new state
-                            if matching_sono.range_circle:
-                                new_colour = pygame.Color("#99C979")  # greenish
-                            else:
-                                new_colour = pygame.Color("#b13b3b")  # reddish
-
-                            slot.toggle_range_circle_button.colours['normal_bg'] = new_colour
-                            slot.toggle_range_circle_button.colours['hovered_bg'] = new_colour
-                            slot.toggle_range_circle_button.rebuild()
+                            sync_slot_range_circle_button_style(slot)
                 if event.ui_element == slot.toggle_bearing_lines_button:
                     if slot.selected is not None:
                         matching_sono = slot.get_passive_sonobuoy_for_slot()
@@ -11324,8 +14462,59 @@ while running:
                 update_contact_context_panel()
             if event.ui_element == contact_lines_button and selected_contact is not None:
                 selected_contact.bearing_lines_hidden = not getattr(selected_contact, "bearing_lines_hidden", False)
+                send_multiplayer_contact_command("lines", selected_contact, bearing_lines_hidden=selected_contact.bearing_lines_hidden)
                 sync_contact_lines_button_style()
                 update_contact_context_panel()
+            if event.ui_element == ship_stop_button and selected_contact_is_surface_ship():
+                request_ship_stop(selected_contact)
+                send_multiplayer_contact_command("ship_stop", selected_contact)
+                update_contact_context_panel()
+            if event.ui_element == ship_heading_button and selected_contact_is_surface_ship():
+                heading_text = ship_heading_entry.get_text().strip()
+                requested_heading = float(heading_text) if heading_text else current_aircraft_heading_deg(getattr(selected_contact, "bearing", 0))
+                request_ship_heading(selected_contact, requested_heading)
+                send_multiplayer_contact_command("ship_heading", selected_contact, heading=requested_heading)
+                sync_ship_command_controls(update_heading_text=True)
+                update_contact_context_panel()
+            if event.ui_element == ship_speed_button and selected_contact_is_surface_ship():
+                speed_text = ship_speed_entry.get_text().strip()
+                request_ship_speed(selected_contact, speed_text)
+                send_multiplayer_contact_command("ship_speed", selected_contact, speed=speed_text)
+                sync_ship_command_controls(update_heading_text=True)
+                update_contact_context_panel()
+            if event.ui_element == ship_resume_route_button and selected_contact_is_surface_ship():
+                resume_ship_route(selected_contact)
+                send_multiplayer_contact_command("ship_resume_route", selected_contact)
+                sync_ship_command_controls(update_heading_text=True)
+                update_contact_context_panel()
+            if event.ui_element == ship_route_speed_button and selected_contact_is_surface_ship():
+                route_speed_text = ship_route_speed_entry.get_text().strip()
+                set_ship_route_speed(selected_contact, route_speed_text)
+                send_multiplayer_contact_command("ship_route_speed", selected_contact, speed=route_speed_text)
+                sync_ship_command_controls(update_heading_text=True)
+                update_contact_context_panel()
+            if event.ui_element == contact_route_button:
+                if selected_contact_is_friendly_surface_ship():
+                    route_text = contact_route_entry.get_text()
+                    assign_ship_route_from_text(selected_contact, route_text)
+                    send_multiplayer_contact_command("ship_route", selected_contact, route_text=route_text)
+                    update_contact_context_panel()
+                else:
+                    print("Route ignored: select a friendly surface ship contact first")
+            if event.ui_element == ship_spawn_aft_button:
+                if selected_contact_is_surface_ship():
+                    spawn_aircraft_aft_of_ship(selected_contact)
+                    update_contact_context_panel()
+                else:
+                    print("Ship aft spawn ignored: select a surface ship contact first")
+            if event.ui_element == ship_deck_lock_button:
+                if selected_contact_is_surface_ship():
+                    toggle_ship_deck_lock(selected_contact)
+                    send_multiplayer_contact_command("deck_lock", selected_contact)
+                    sync_ship_command_controls(update_heading_text=True)
+                    update_contact_context_panel()
+                else:
+                    print("Deck lock ignored: select a surface ship contact first")
         if event.type == pygame_gui.UI_DROP_DOWN_MENU_CHANGED:
 
 
@@ -11355,6 +14544,7 @@ while running:
                     selected_contact.classification_type = event.text
                     class_options = contact_possible_type_list.get(event.text, contact_possible_type_list["Unknown"])
                     selected_contact.classification_class = class_options[0]
+                    send_multiplayer_contact_command("classify", selected_contact, classification_type=selected_contact.classification_type, classification_class=selected_contact.classification_class)
 
                     contact_class_dropdown.kill()
                     contact_class_dropdown = pygame_gui.elements.UIDropDownMenu(
@@ -11370,16 +14560,19 @@ while running:
                 if event.ui_element == contact_class_dropdown and selected_contact is not None:
                     selected_contact.operator_classified = True
                     selected_contact.classification_class = event.text
+                    send_multiplayer_contact_command("classify", selected_contact, classification_type=selected_contact.classification_type, classification_class=selected_contact.classification_class)
                     update_contact_context_panel()
 
                 if event.ui_element == contact_status_dropdown and selected_contact is not None:
                     selected_contact.operator_classified = True
                     selected_contact.identity_status = event.text
+                    send_multiplayer_contact_command("identity", selected_contact, identity_status=selected_contact.identity_status)
                     update_contact_context_panel()
 
                 if event.ui_element == contact_country_dropdown and selected_contact is not None:
                     selected_contact.operator_classified = True
                     selected_contact.country = event.text
+                    send_multiplayer_contact_command("country", selected_contact, country=selected_contact.country)
                     update_contact_context_panel()
                 
                 for slot in spectrogram_slot_array:
@@ -11454,9 +14647,12 @@ while running:
     else:
         player_pos = pygame.Vector2(float(lat),float(long))
         update_auto_buoy_system()
+        update_permanent_ownship_sonar()
+        update_manual_deck_lock()
         
 
     update_multiplayer()
+    update_host_civilian_traffic()
 
 
 
@@ -11537,8 +14733,11 @@ while running:
             continue
         if any(tone.label == "FMCW" for tone in contact.tones):
             continue
-        if getattr(contact, "speed", 0) != 0:
-            contact.move(dt)
+        if not update_contact_shadow_following(contact, dt):
+            update_ship_route_following(contact)
+            apply_ship_command_dynamics(contact, dt)
+            if getattr(contact, "speed", 0) != 0:
+                contact.move(dt)
         append_fading_trail(contact, contact.pos, max_points=120)
 
     update_submarine_reactions(dt)
@@ -11549,6 +14748,7 @@ while running:
     update_ship_injections()
     update_msfs_splashes()
     if display_mode == "MAP":
+        draw_ship_routes(map_overlay_surface)
         draw_contact_map_trails(map_overlay_surface)
         draw_splash_effects(map_overlay_surface)
 
@@ -11757,6 +14957,8 @@ while running:
     
     if display_mode == "RADAR":
         draw_radar_display(map_surf)
+    elif display_mode == "NAV":
+        draw_nav_display(map_surf)
     else:
         map_surf.blit(map_surface,(0,0))
     draw_search_pattern(map_surf)
@@ -11802,83 +15004,7 @@ while running:
  
 stop_listen_audio()
 close_multiplayer_socket()
-pygame.quit() 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+pygame.quit()
 
 
 

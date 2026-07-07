@@ -168,7 +168,7 @@ DIFAR_DETECTION_UPDATE_INTERVAL_SEC = 0.20
 DIFAR_HIDDEN_DETECTION_UPDATE_INTERVAL_SEC = 1.50
 DIFAR_DETECTION_UPDATE_JITTER_SEC = 0.45
 SOUND_SPEED_MPS = 1500.0
-APP_VERSION = "0.3.2"
+APP_VERSION = "0.3.3"
 GITHUB_OWNER = "DatDerpyWasTaken"
 GITHUB_REPO = "vASW"
 GITHUB_RELEASE_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
@@ -180,6 +180,7 @@ MULTIPLAYER_STATE_BROADCAST_INTERVAL = 1.0
 MULTIPLAYER_STALE_SECONDS = 8.0
 MULTIPLAYER_CONTACT_PASSWORD = os.environ.get("VASW_CONTACT_PASSWORD", "d0yl3!))")
 MULTIPLAYER_CONTACT_CONTRIBUTION_INTERVAL = 1.5
+SERVER_CONTACT_AUTOSAVE_SECONDS = 300.0
 MULTIPLAYER_ID = str(uuid.uuid4())
 MULTIPLAYER_CALLSIGN = os.environ.get("COMPUTERNAME", "AIRCRAFT")[:12]
 MULTIPLAYER_AIRCRAFT_TYPE = "P8"
@@ -216,6 +217,10 @@ multiplayer_host_seen = None
 multiplayer_peers = {}
 multiplayer_channel_assignments = {}
 multiplayer_contact_password = ""
+server_contact_autosave_last = 0.0
+server_command_queue = Queue()
+server_command_thread = None
+duplicate_contact_pending_row = None
 player_channel_range = (1, 99)
 
 if not os.path.exists(LOG_FILE):
@@ -2778,6 +2783,47 @@ for element in update_popup_elements:
     element.hide()
 
 
+
+duplicate_contact_popup_visible = False
+duplicate_contact_popup_panel = pygame_gui.elements.UIPanel(
+    relative_rect=pygame.Rect((690, 420), (540, 190)),
+    manager=manager
+)
+duplicate_contact_popup_title = pygame_gui.elements.UILabel(
+    relative_rect=pygame.Rect((20, 18), (500, 30)),
+    text="Duplicate contact name",
+    manager=manager,
+    container=duplicate_contact_popup_panel
+)
+duplicate_contact_popup_message = pygame_gui.elements.UITextBox(
+    relative_rect=pygame.Rect((24, 58), (492, 64)),
+    html_text="A contact with this name already exists. Override it?",
+    manager=manager,
+    container=duplicate_contact_popup_panel
+)
+duplicate_contact_override_button = pygame_gui.elements.UIButton(
+    relative_rect=pygame.Rect((118, 136), (130, 34)),
+    text="OVERRIDE",
+    manager=manager,
+    container=duplicate_contact_popup_panel
+)
+duplicate_contact_cancel_button = pygame_gui.elements.UIButton(
+    relative_rect=pygame.Rect((292, 136), (130, 34)),
+    text="CANCEL",
+    manager=manager,
+    container=duplicate_contact_popup_panel
+)
+duplicate_contact_popup_elements = [
+    duplicate_contact_popup_panel,
+    duplicate_contact_popup_title,
+    duplicate_contact_popup_message,
+    duplicate_contact_override_button,
+    duplicate_contact_cancel_button
+]
+register_ui_element(duplicate_contact_popup_panel, pygame.Rect((690, 420), (540, 190)))
+for element in duplicate_contact_popup_elements:
+    element.hide()
+
 def parse_version_tag(tag):
     nums = [int(part) for part in re.findall(r"\d+", str(tag or ""))[:3]]
     while len(nums) < 3:
@@ -3116,6 +3162,128 @@ def delete_contact(contact, delete_rows=True):
     print(f"Deleted contact {getattr(contact, 'name', 'Contact')} track {track_number if track_number is not None else '?'}")
     return True
 
+
+
+def contact_by_name(name):
+    wanted = str(name or "").strip()
+    if not wanted:
+        return None
+    for contact in contacts:
+        if str(getattr(contact, "name", "") or "").strip() == wanted:
+            return contact
+    return None
+
+
+def set_duplicate_contact_popup_visible(visible, row=None, name=""):
+    global duplicate_contact_popup_visible, duplicate_contact_pending_row
+    duplicate_contact_popup_visible = bool(visible)
+    duplicate_contact_pending_row = row if visible else None
+    if visible:
+        duplicate_contact_popup_message.set_text(f"Contact {name} already exists. Override it?")
+    for element in duplicate_contact_popup_elements:
+        if duplicate_contact_popup_visible:
+            element.show()
+        else:
+            element.hide()
+
+
+def define_contact_from_row(row, override_duplicate=False):
+    try:
+        row.update_from_textboxes()
+    except Exception:
+        pass
+    print(row.name_entered, row.lat_entered, row.long_entered, row.range_entered, row.class_entered, row.speed_entered, row.depth_entered, row.bearing_entered)
+    if not (row.name_entered and row.lat_entered is not None and row.long_entered is not None
+            and row.range_entered is not None and row.internal_type_entered and row.internal_class_entered
+            and row.speed_entered is not None and row.depth_entered is not None and row.bearing_entered is not None):
+        return False
+
+    existing_contact = contact_by_name(row.name_entered)
+    if existing_contact is not None and not override_duplicate:
+        set_duplicate_contact_popup_visible(True, row, row.name_entered)
+        return False
+    if existing_contact is not None and override_duplicate:
+        delete_contact(existing_contact)
+
+    spawn_lat, spawn_lon = random_point_within_range_nm(row.lat_entered, row.long_entered, row.range_entered)
+    new_contact = Contact(
+        name=row.name_entered,
+        tones=[],
+        contact_lat=spawn_lat,
+        contact_long=spawn_lon,
+        speed=row.speed_entered,
+        depth=row.depth_entered,
+        bearing=row.bearing_entered
+    )
+    resolved_internal_class = (
+        resolve_submarine_class_selection(row.internal_class_entered)
+        if row.internal_type_entered == "Sub-surface" else row.internal_class_entered
+    )
+    new_contact.internal_type = row.internal_type_entered
+    new_contact.internal_class = resolved_internal_class
+    new_contact.broadcasting = row.broadcasting_entered
+    new_contact.team = row.team_entered
+    new_contact.shadow_target_name = row.shadow_target_textbox.get_text().strip()
+    new_contact.shadow_distance_nm = 5.0
+    new_contact.model_library = row.selected_model_library
+    if row.selected_model != "Auto":
+        new_contact.gaist_model_title = row.selected_model
+
+    acoustic_class = resolved_internal_class if row.internal_type_entered == "Sub-surface" else ""
+    contact_class = sub_classes.get(acoustic_class)
+    if contact_class is not None:
+        sub_instance = contact_class(
+            name=new_contact.name,
+            contact_lat=new_contact.contact_lat,
+            contact_long=new_contact.contact_long,
+            speed=new_contact.speed,
+            depth=new_contact.depth,
+            bearing=new_contact.bearing
+        )
+        new_contact.tones = sub_instance.tones
+    elif row.internal_type_entered == "Surface-Ship":
+        if row.internal_class_entered == "Civilian":
+            new_contact.classification_type = "Surface-Ship"
+            new_contact.classification_class = "Civilian"
+            new_contact.identity_status = "N"
+            new_contact.operator_classified = True
+        else:
+            reset_contact_classification(new_contact)
+        new_contact.detected = row.internal_class_entered == "Civilian"
+        gaist_model_title_for_contact(new_contact)
+        apply_surface_ship_acoustic_profile(new_contact)
+    elif row.internal_type_entered == "Biological":
+        if row.internal_class_entered == "Whale":
+            new_contact.tones = whale_acoustic_profile()
+            new_contact.acoustic_profile = "Whale"
+        new_contact.classification_type = "Biological"
+        new_contact.classification_class = row.internal_class_entered
+        new_contact.identity_status = "N"
+        new_contact.operator_classified = True
+        new_contact.detected = False
+
+    row.route_text_entered = row.route_textbox.get_text().strip()
+    row.shadow_target_entered = row.shadow_target_textbox.get_text().strip()
+    new_contact.shadow_target_name = row.shadow_target_entered
+    new_contact.shadow_distance_nm = 5.0
+    if row.is_route_enabled() and row.route_text_entered:
+        assign_ship_route_from_text(new_contact, row.route_text_entered)
+
+    contacts.append(new_contact)
+    if multiplayer_role == "JOIN" and multiplayer_contact_password_ok():
+        send_multiplayer_contact_contribution()
+    update_all_contact_shadow_following()
+    print(
+        f"Added contact: {new_contact.name}, Track #{new_contact.track_number}, "
+        f"Tones: {len(new_contact.tones)}, spawned {haversine(row.lat_entered, row.long_entered, spawn_lat, spawn_lon):.2f} NM from requested point"
+    )
+    last_row = contact_define_row_array[-1]
+    new_x = last_row.row_panel.rect.right + 10
+    new_row = ContactDefineRow(y=0, manager=manager, container=contact_define_container)
+    new_row.row_panel.set_relative_position((new_x, 10))
+    contact_define_row_array.append(new_row)
+    update_contact_define_scroll_area()
+    return True
 
 def draw_menu():
     # Fill menu background
@@ -4262,6 +4430,9 @@ def multiplayer_contact_password_ok(password=None):
     return str(candidate or "") == MULTIPLAYER_CONTACT_PASSWORD
 
 
+PROTECTED_CONTACT_COMMANDS = {"delete"}
+
+
 def multiplayer_host_requires_password():
     return bool(multiplayer_host_seen and multiplayer_host_seen.get("password_required"))
 
@@ -4417,11 +4588,18 @@ def multiplayer_platform_label():
     return dropdown_value(MULTIPLAYER_AIRCRAFT_TYPE) if player_type == "Aircraft" else player_type
 
 
+def multiplayer_password_status_label_text():
+    if not multiplayer_contact_password:
+        return "PW NONE"
+    return "PW OK" if multiplayer_contact_password_ok() else "PW BAD"
+
+
 def sync_multiplayer_menu_status():
     player_type = dropdown_value(MULTIPLAYER_PLAYER_TYPE)
     platform = multiplayer_platform_label()
     team = dropdown_value(MULTIPLAYER_TEAM) if player_type != "Aircraft" else ""
-    suffix = f" / {platform}" + (f" / {team}" if team else "")
+    password_suffix = f" / {multiplayer_password_status_label_text()}" if multiplayer_role in ("SERVER", "HOST", "JOIN") else ""
+    suffix = f" / {platform}" + (f" / {team}" if team else "") + password_suffix
     if player_type in ("Ship", "Submarine"):
         suffix += f" / {dropdown_value(ownship_control_contact_key)}"
     if multiplayer_role == "OFF":
@@ -10544,9 +10722,33 @@ def route_position_at_elapsed(points, speed_kts, elapsed_seconds, loop=False):
     return last[0], last[1], bearing, max(0, len(points) - 1), False
 
 
+def route_points_with_contact_start(contact, points):
+    points = list(points or [])
+    if not points:
+        return points, False
+    try:
+        current = (float(contact.contact_lat), float(contact.contact_long))
+    except (TypeError, ValueError):
+        return points, False
+    if not (-90 <= current[0] <= 90 and -180 <= current[1] <= 180):
+        return points, False
+    if haversine(current[0], current[1], points[0][0], points[0][1]) <= ship_route_arrival_radius_nm:
+        return points, False
+    return [current] + points, True
+
+
+def route_points_for_config(contact):
+    points = list(getattr(contact, "route_waypoints", []) or [])
+    if getattr(contact, "route_runtime_start_inserted", False) and len(points) > 1:
+        return points[1:]
+    return points
+
+
 def configure_ship_route(contact, route_config, now=None):
     points = parse_route_waypoints(route_config.get("waypoints", route_config) if isinstance(route_config, dict) else route_config)
+    points, inserted_start = route_points_with_contact_start(contact, points)
     contact.route_waypoints = points
+    contact.route_runtime_start_inserted = inserted_start
     contact.route_index = 0
     contact.route_active = False
     contact.route_status = "No route"
@@ -10558,10 +10760,13 @@ def configure_ship_route(contact, route_config, now=None):
     contact.route_speed_kts = max(0.0, float(route_source.get("speed", route_source.get("speed_kts", speed_default)) or 0.0))
     contact.route_loop = bool(route_source.get("loop", route_source.get("route_loop", False)))
     start_default = now if now is not None else time.time()
-    contact.route_started_at_utc = parse_route_timestamp(
-        route_source.get("started_at_utc", route_source.get("start_utc", route_source.get("started_at"))),
-        start_default
-    )
+    if inserted_start:
+        contact.route_started_at_utc = start_default
+    else:
+        contact.route_started_at_utc = parse_route_timestamp(
+            route_source.get("started_at_utc", route_source.get("start_utc", route_source.get("started_at"))),
+            start_default
+        )
     contact.route_active = len(points) > 1 and contact.route_speed_kts > 0.0
     contact.route_manual_paused = False
     contact.route_status = f"Route: {len(points)} WPT" if contact.route_active else "Route idle"
@@ -10677,7 +10882,7 @@ def route_text_from_saved_config(data):
         formatted.append(f"{lat_value:.5f},{lon_value:.5f}")
     return " ".join(formatted)
 def ship_route_config_from_contact(contact):
-    points = getattr(contact, "route_waypoints", [])
+    points = route_points_for_config(contact)
     if not points:
         return None
     return {
@@ -10791,6 +10996,163 @@ def autosave_ship_route_to_config(contact):
         return False
     print(f"Ship route autosaved for {contact_name}")
     return True
+
+def live_contact_to_config_entry(contact):
+    entry = {
+        "name": str(getattr(contact, "name", "Contact")),
+        "latitude": float(getattr(contact, "contact_lat", 0.0) or 0.0),
+        "longitude": float(getattr(contact, "contact_long", 0.0) or 0.0),
+        "range": 0.0,
+        "speed": float(getattr(contact, "speed", 0.0) or 0.0),
+        "depth": float(getattr(contact, "depth", 0.0) or 0.0),
+        "bearing": float(getattr(contact, "bearing", 0.0) or 0.0) % 360.0,
+        "class": str(getattr(contact, "internal_class", "Akula") or "Akula"),
+        "internal_type": str(getattr(contact, "internal_type", "Unknown") or "Unknown"),
+        "internal_class": str(getattr(contact, "internal_class", "Unknown") or "Unknown"),
+        "broadcasting": bool(getattr(contact, "broadcasting", False)),
+        "team": str(getattr(contact, "team", "Neutral") or "Neutral"),
+        "model_library": normalize_model_library(getattr(contact, "model_library", MODEL_LIBRARY_AUTO)),
+        "model": str(getattr(contact, "gaist_model_title", "Auto") or "Auto")
+    }
+    if entry["internal_type"] != "Sub-surface":
+        entry["class"] = "Akula"
+    route_config = ship_route_config_from_contact(contact)
+    if route_config is not None:
+        entry["route"] = route_config
+    merge_live_contact_state_into_saved(entry, contact)
+    return entry
+
+
+def save_all_live_contacts_to_config(reason="autosave"):
+    cfg_path = globals().get("config_path", "config.json")
+    try:
+        with open(cfg_path, "r") as f:
+            saved_config = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[SERVER] contact {reason} failed: could not read config.json: {exc}")
+        return False
+    entries = saved_config.setdefault("submarines", [])
+    by_name = {str(entry.get("name", "")): entry for entry in entries if isinstance(entry, dict)}
+    for contact in contacts:
+        name = str(getattr(contact, "name", "") or "").strip()
+        if not name or is_dicass_ping_contact(contact):
+            continue
+        live_entry = live_contact_to_config_entry(contact)
+        if name in by_name:
+            by_name[name].update(live_entry)
+        else:
+            entries.append(live_entry)
+            by_name[name] = live_entry
+    try:
+        with open(cfg_path, "w") as f:
+            json.dump(saved_config, f, indent=4)
+    except OSError as exc:
+        print(f"[SERVER] contact {reason} failed: could not write config.json: {exc}")
+        return False
+    print(f"[SERVER] contact {reason} saved {len(entries)} config contacts")
+    return True
+
+
+def maybe_server_contact_autosave():
+    global server_contact_autosave_last
+    if not DEDICATED_HOST_MODE:
+        return
+    now = time.time()
+    if now - server_contact_autosave_last >= SERVER_CONTACT_AUTOSAVE_SECONDS:
+        server_contact_autosave_last = now
+        save_all_live_contacts_to_config("autosave")
+
+
+def server_console_reader():
+    while True:
+        try:
+            line = sys.stdin.readline()
+        except Exception:
+            break
+        if not line:
+            break
+        server_command_queue.put(line.strip())
+
+
+def start_server_console_thread():
+    global server_command_thread
+    if server_command_thread is not None:
+        return
+    server_command_thread = Thread(target=server_console_reader, daemon=True)
+    server_command_thread.start()
+
+
+def parse_server_contact_name(name):
+    name = str(name or "").strip().strip("\"\"")
+    return contact_by_name(name)
+
+
+def handle_server_command(line):
+    if not line:
+        return
+    lower = line.lower()
+    if lower in ("help", "?"):
+        print("[SERVER] commands: hdg <contact> <000>, spd <contact> <kts>, stop <contact>, <contact> shadow <target>, <contact> unshadow, save")
+        return
+    if lower == "save":
+        save_all_live_contacts_to_config("manual save")
+        return
+    if " shadow " in lower:
+        split_at = lower.index(" shadow ")
+        source_name = line[:split_at].strip()
+        target_name = line[split_at + len(" shadow "):].strip()
+        contact = parse_server_contact_name(source_name)
+        target = parse_server_contact_name(target_name)
+        if contact is None or target is None:
+            print("[SERVER] shadow failed: contact or target not found")
+            return
+        contact.shadow_target_name = getattr(target, "name", target_name)
+        contact.shadow_distance_nm = 5.0
+        update_all_contact_shadow_following()
+        print(f"[SERVER] {contact.name} shadowing {target.name}")
+        return
+    if lower.endswith(" unshadow"):
+        source_name = line[:-len(" unshadow")].strip()
+        contact = parse_server_contact_name(source_name)
+        if contact is None:
+            print("[SERVER] unshadow failed: contact not found")
+            return
+        contact.shadow_target_name = ""
+        contact.shadow_status = "No shadow target"
+        print(f"[SERVER] {contact.name} shadow cleared")
+        return
+    parts = line.split()
+    if len(parts) >= 3 and parts[0].lower() in ("hdg", "heading"):
+        contact = parse_server_contact_name(" ".join(parts[1:-1]))
+        if contact is None:
+            print("[SERVER] heading failed: contact not found")
+            return
+        request_ship_heading(contact, float(parts[-1]))
+        print(f"[SERVER] {contact.name} heading {float(parts[-1]) % 360.0:03.0f}")
+        return
+    if len(parts) >= 3 and parts[0].lower() in ("spd", "speed"):
+        contact = parse_server_contact_name(" ".join(parts[1:-1]))
+        if contact is None:
+            print("[SERVER] speed failed: contact not found")
+            return
+        request_ship_speed(contact, parts[-1])
+        print(f"[SERVER] {contact.name} speed {parts[-1]}")
+        return
+    if len(parts) >= 2 and parts[0].lower() == "stop":
+        contact = parse_server_contact_name(" ".join(parts[1:]))
+        if contact is None:
+            print("[SERVER] stop failed: contact not found")
+            return
+        request_ship_stop(contact)
+        print(f"[SERVER] {contact.name} stopped")
+        return
+    print(f"[SERVER] unknown command: {line}")
+
+
+def process_server_commands():
+    while not server_command_queue.empty():
+        handle_server_command(server_command_queue.get())
+
 def assign_ship_route_from_text(contact, route_text, loop=False):
     if contact is None or getattr(contact, "internal_type", "") != "Surface-Ship":
         print("Ship route ignored: select a surface ship contact first")
@@ -12009,6 +12371,8 @@ def apply_contact_command_to_contact(contact, command, payload):
         set_ship_route_speed(contact, payload.get("speed", getattr(contact, "route_speed_kts", getattr(contact, "speed", 0.0))))
     elif command == "ship_route":
         assign_ship_route_from_text(contact, str(payload.get("route_text", "")))
+    elif command == "delete":
+        return delete_contact(contact)
     elif command == "deck_lock":
         if selected_contact is contact:
             toggle_ship_deck_lock(contact)
@@ -12038,6 +12402,8 @@ def send_multiplayer_contact_command(command, contact=None, **payload):
         "payload": payload,
         "timestamp": time.time()
     }
+    if multiplayer_contact_password:
+        packet["password"] = multiplayer_contact_password
     try:
         sock.sendto(json.dumps(packet).encode("utf-8"), ("255.255.255.255", MULTIPLAYER_PORT))
         return True
@@ -12047,11 +12413,15 @@ def send_multiplayer_contact_command(command, contact=None, **payload):
 
 
 def apply_multiplayer_contact_command(packet):
+    command = str(packet.get("command") or "")
+    if command in PROTECTED_CONTACT_COMMANDS and not multiplayer_contact_password_ok(packet.get("password", "")):
+        print(f"[MP] rejected protected contact command {command}: bad password")
+        return
     contact = contact_by_track_number(packet.get("track_number"))
     payload = packet.get("payload", {})
     if not isinstance(payload, dict):
         payload = {}
-    if apply_contact_command_to_contact(contact, packet.get("command"), payload):
+    if apply_contact_command_to_contact(contact, command, payload):
         print(f"[MP] applied contact command {packet.get('command')} for track {packet.get('track_number')}")
 
 def send_multiplayer_launch_request():
@@ -13267,6 +13637,7 @@ if DEDICATED_HOST_MODE:
     except Exception:
         pass
     print(f"[SERVER] Dedicated vASW server running as {MULTIPLAYER_CALLSIGN} on UDP {MULTIPLAYER_PORT}")
+    start_server_console_thread()
 
 # ---------------------------------------------------------------------------
 # Main loop
@@ -13277,6 +13648,8 @@ if DEDICATED_HOST_MODE:
 #   3. update sonar/contact state
 #   4. draw map, overlays, spectrograms, and UI
 while running:
+    process_server_commands()
+    maybe_server_contact_autosave()
     if state == STATE_MENU:
         draw_menu()
 
@@ -13833,113 +14206,29 @@ while running:
                 check_and_install_update()
             if event.ui_element == update_popup_later_button:
                 set_update_popup_visible(False)
+            if event.ui_element == duplicate_contact_cancel_button:
+                set_duplicate_contact_popup_visible(False)
+            if event.ui_element == duplicate_contact_override_button:
+                if duplicate_contact_pending_row is not None:
+                    define_contact_from_row(duplicate_contact_pending_row, override_duplicate=True)
+                set_duplicate_contact_popup_visible(False)
             for row in list(contact_define_row_array):
                 if event.ui_element == row.broadcasting_checkbox:
                     row.set_broadcasting(not row.broadcasting_entered)
                 if event.ui_element == row.delete_contact_button:
+                    contact_name = row_contact_name(row)
+                    target_contact = next((contact for contact in contacts if str(getattr(contact, "name", "")) == contact_name), None)
+                    if multiplayer_role == "JOIN" and not multiplayer_contact_password_ok():
+                        print("Delete ignored: enter the contact password first")
+                        continue
+                    if multiplayer_role == "JOIN" and target_contact is not None:
+                        send_multiplayer_contact_command("delete", target_contact)
                     delete_contact_define_row(row, delete_live=True)
                     continue
                 
                 if event.ui_element == row.define_contact_button:
-                    print(row.name_entered, row.lat_entered, row.long_entered, row.range_entered, row.class_entered, row.speed_entered, row.depth_entered, row.bearing_entered)
-                    if (row.name_entered and row.lat_entered and row.long_entered
-                        and row.range_entered and row.internal_type_entered and row.internal_class_entered and row.speed_entered and row.depth_entered and row.bearing_entered):
-
-                        spawn_lat, spawn_lon = random_point_within_range_nm(
-                            row.lat_entered,
-                            row.long_entered,
-                            row.range_entered
-                        )
-
-                        new_contact = Contact(
-                            name=row.name_entered,
-                            tones=[],  # empty for now
-                            contact_lat=spawn_lat,
-                            contact_long=spawn_lon,
-                            speed=row.speed_entered,
-                            depth=row.depth_entered,
-                            bearing=row.bearing_entered
-                        )
-                        resolved_internal_class = (
-                            resolve_submarine_class_selection(row.internal_class_entered)
-                            if row.internal_type_entered == "Sub-surface" else row.internal_class_entered
-                        )
-                        new_contact.internal_type = row.internal_type_entered
-                        new_contact.internal_class = resolved_internal_class
-                        new_contact.broadcasting = row.broadcasting_entered
-                        new_contact.team = row.team_entered
-                        new_contact.shadow_target_name = row.shadow_target_textbox.get_text().strip()
-                        new_contact.shadow_distance_nm = 5.0
-                        new_contact.model_library = row.selected_model_library
-                        if row.selected_model != "Auto":
-                            new_contact.gaist_model_title = row.selected_model
-
-                        acoustic_class = resolved_internal_class if row.internal_type_entered == "Sub-surface" else ""
-                        contact_class = sub_classes.get(acoustic_class)
-                        if contact_class is not None:
-                            sub_instance = contact_class(
-                                name=new_contact.name,
-                                contact_lat=new_contact.contact_lat,
-                                contact_long=new_contact.contact_long,
-                                speed=new_contact.speed,
-                                depth=new_contact.depth,
-                                bearing=new_contact.bearing
-                            )
-                            new_contact.tones = sub_instance.tones
-                        elif (
-                            row.internal_type_entered == "Surface-Ship"
-                        ):
-                            if row.internal_class_entered == "Civilian":
-                                new_contact.classification_type = "Surface-Ship"
-                                new_contact.classification_class = "Civilian"
-                                new_contact.identity_status = "N"
-                                new_contact.operator_classified = True
-                            else:
-                                reset_contact_classification(new_contact)
-                            new_contact.detected = row.internal_class_entered == "Civilian"
-                            gaist_model_title_for_contact(new_contact)
-                            apply_surface_ship_acoustic_profile(new_contact)
-                        elif row.internal_type_entered == "Biological":
-                            if row.internal_class_entered == "Whale":
-                                new_contact.tones = whale_acoustic_profile()
-                                new_contact.acoustic_profile = "Whale"
-                            new_contact.classification_type = "Biological"
-                            new_contact.classification_class = row.internal_class_entered
-                            new_contact.identity_status = "N"
-                            new_contact.operator_classified = True
-                            new_contact.detected = False
-
-                        row.route_text_entered = row.route_textbox.get_text().strip()
-                        row.shadow_target_entered = row.shadow_target_textbox.get_text().strip()
-                        new_contact.shadow_target_name = row.shadow_target_entered
-                        new_contact.shadow_distance_nm = 5.0
-                        if row.is_route_enabled() and row.route_text_entered:
-                            assign_ship_route_from_text(new_contact, row.route_text_entered)
-
-                        contacts.append(new_contact)
-                        if multiplayer_role == "JOIN" and multiplayer_contact_password_ok():
-                            send_multiplayer_contact_contribution()
-                        update_all_contact_shadow_following()
-                        print(
-                            f"Added contact: {new_contact.name}, Track #{new_contact.track_number}, "
-                            f"Tones: {len(new_contact.tones)}, spawned {haversine(row.lat_entered, row.long_entered, spawn_lat, spawn_lon):.2f} NM from requested point"
-                        )
-                        last_row = contact_define_row_array[-1]
-                        new_x = last_row.row_panel.rect.right + 10  # 10 px spacing
-                        new_row = ContactDefineRow(y=0, manager=manager, container=contact_define_container)
-                        new_row.row_panel.set_relative_position((new_x, 10))  # position next to last row
-                        contact_define_row_array.append(new_row)
-                        update_contact_define_scroll_area()
-
-
-
-
-
-
-
-
-
-
+                    define_contact_from_row(row)
+                    continue
 
         if event.type == pygame_gui.UI_BUTTON_PRESSED: # menu simulator button
             if event.ui_element == map_mode_button:
@@ -14001,6 +14290,15 @@ while running:
             if event.ui_element == xbt_raytrace_clear_button:
                 clear_ray_trace()
             if event.ui_element == contact_delete_button:
+                if selected_contact is not None:
+                    if multiplayer_role == "JOIN":
+                        if multiplayer_contact_password_ok():
+                            send_multiplayer_contact_command("delete", selected_contact)
+                            delete_contact(selected_contact)
+                        else:
+                            print("Delete ignored: enter the contact password first")
+                    else:
+                        delete_contact(selected_contact)
                 continue
             if event.ui_element == contact_context_close_button:
                 contact_context_user_closed = True

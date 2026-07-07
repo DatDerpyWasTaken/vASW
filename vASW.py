@@ -138,6 +138,7 @@ HOST_CIVILIAN_TRAFFIC_RADIUS_NM = 100.0
 HOST_CIVILIAN_TRAFFIC_TARGET_PER_PLAYER = 8
 HOST_CIVILIAN_TRAFFIC_REFRESH_SECONDS = 45.0
 host_civilian_traffic_last_update = 0.0
+host_civilian_traffic_generated_origins = set()
 aishub_last_fetch_at = 0.0
 aishub_last_error = ""
 aishub_disabled_notice_shown = False
@@ -3180,6 +3181,19 @@ def set_duplicate_contact_popup_visible(visible, row=None, name=""):
     duplicate_contact_pending_row = row if visible else None
     if visible:
         duplicate_contact_popup_message.set_text(f"Contact {name} already exists. Override it?")
+        for layer_offset, element in enumerate(duplicate_contact_popup_elements):
+            change_layer = getattr(element, "change_layer", None)
+            if change_layer is not None:
+                try:
+                    change_layer(1000 + layer_offset)
+                except Exception:
+                    pass
+        focus = getattr(duplicate_contact_popup_panel, "focus", None)
+        if focus is not None:
+            try:
+                focus()
+            except Exception:
+                pass
     for element in duplicate_contact_popup_elements:
         if duplicate_contact_popup_visible:
             element.show()
@@ -3187,7 +3201,7 @@ def set_duplicate_contact_popup_visible(visible, row=None, name=""):
             element.hide()
 
 
-def define_contact_from_row(row, override_duplicate=False):
+def define_contact_from_row(row, override_duplicate=False, prompt_duplicate=True):
     try:
         row.update_from_textboxes()
     except Exception:
@@ -3200,7 +3214,8 @@ def define_contact_from_row(row, override_duplicate=False):
 
     existing_contact = contact_by_name(row.name_entered)
     if existing_contact is not None and not override_duplicate:
-        set_duplicate_contact_popup_visible(True, row, row.name_entered)
+        if prompt_duplicate:
+            set_duplicate_contact_popup_visible(True, row, row.name_entered)
         return False
     if existing_contact is not None and override_duplicate:
         delete_contact(existing_contact)
@@ -3270,6 +3285,7 @@ def define_contact_from_row(row, override_duplicate=False):
         assign_ship_route_from_text(new_contact, row.route_text_entered)
 
     contacts.append(new_contact)
+    row.defined_contact_track = getattr(new_contact, "track_number", None)
     if multiplayer_role == "JOIN" and multiplayer_contact_password_ok():
         send_multiplayer_contact_contribution()
     update_all_contact_shadow_following()
@@ -3284,6 +3300,26 @@ def define_contact_from_row(row, override_duplicate=False):
     contact_define_row_array.append(new_row)
     update_contact_define_scroll_area()
     return True
+
+
+def first_duplicate_contact_row():
+    for row in contact_define_row_array:
+        try:
+            row.update_from_textboxes()
+        except Exception:
+            pass
+        name = str(getattr(row, "name_entered", "") or "").strip()
+        if not name:
+            continue
+        existing_contact = contact_by_name(name)
+        if existing_contact is None:
+            continue
+        row_track = getattr(row, "defined_contact_track", None)
+        if row_track is not None and int(getattr(existing_contact, "track_number", -1) or -1) == int(row_track):
+            continue
+        return row, name
+    return None, ""
+
 
 def draw_menu():
     # Fill menu background
@@ -8888,6 +8924,7 @@ def add_contact_creation_row_for_contact(contact, range_nm=0):
     row.sub_bearing_textbox.set_text(str(int(round(float(getattr(contact, "bearing", 0) or 0)))))
     row.sub_depth_textbox.set_text(str(int(round(float(getattr(contact, "depth", 0) or 0)))))
     row.update_from_textboxes()
+    row.defined_contact_track = getattr(contact, "track_number", None)
     update_contact_define_scroll_area()
     return row
 
@@ -8989,7 +9026,7 @@ def random_host_civilian_contact(origin, name):
         (spawn_bearing + random.uniform(65, 295)) % 360
     )
     contact.source = "HostCivilian"
-    contact.host_civilian_owner = origin["id"]
+    contact.host_civilian_owner = str(origin["id"])
     return contact
 
 
@@ -9016,18 +9053,27 @@ def update_host_civilian_traffic(force=False):
     created = 0
     start_number = len([contact for contact in contacts if getattr(contact, "internal_class", "") == "Civilian"]) + 1
     for origin in origins:
+        origin_id = str(origin.get("id", ""))
+        if not origin_id:
+            continue
         nearby = [
             contact for contact in contacts
             if getattr(contact, "source", "") == "HostCivilian" and
-            haversine(origin["lat"], origin["lon"], contact.contact_lat, contact.contact_long) <= HOST_CIVILIAN_TRAFFIC_RADIUS_NM
+            str(getattr(contact, "host_civilian_owner", "")) == origin_id
         ]
+        if origin_id in host_civilian_traffic_generated_origins:
+            continue
         needed = max(0, HOST_CIVILIAN_TRAFFIC_TARGET_PER_PLAYER - len(nearby))
+        made_for_origin = 0
         for _ in range(needed):
             contact = random_host_civilian_contact(origin, f"CIV {start_number + created:02d}")
             if contact is None:
                 continue
             contacts.append(contact)
             created += 1
+            made_for_origin += 1
+        if made_for_origin or nearby:
+            host_civilian_traffic_generated_origins.add(origin_id)
 
     removed = before_count + created - len(contacts)
     if created or removed:
@@ -10927,6 +10973,8 @@ def apply_saved_contact_state(contact, data):
     contact.operator_classified = bool(data.get("operator_classified", getattr(contact, "operator_classified", False)))
     contact.detected = bool(data.get("detected", getattr(contact, "detected", False)))
     contact.broadcasting = bool(data.get("broadcasting", getattr(contact, "broadcasting", False)))
+    contact.source = str(data.get("source", getattr(contact, "source", "")) or "")
+    contact.host_civilian_owner = str(data.get("host_civilian_owner", getattr(contact, "host_civilian_owner", "")) or "")
     contact.team = str(data.get("team", getattr(contact, "team", "Neutral")))
     contact.shadow_target_name = shadow_target_name_from_saved_config(data)
     contact.shadow_distance_nm = shadow_distance_from_saved_config(data)
@@ -11011,6 +11059,8 @@ def live_contact_to_config_entry(contact):
         "internal_class": str(getattr(contact, "internal_class", "Unknown") or "Unknown"),
         "broadcasting": bool(getattr(contact, "broadcasting", False)),
         "team": str(getattr(contact, "team", "Neutral") or "Neutral"),
+        "source": str(getattr(contact, "source", "") or ""),
+        "host_civilian_owner": str(getattr(contact, "host_civilian_owner", "") or ""),
         "model_library": normalize_model_library(getattr(contact, "model_library", MODEL_LIBRARY_AUTO)),
         "model": str(getattr(contact, "gaist_model_title", "Auto") or "Auto")
     }
@@ -11923,6 +11973,8 @@ def contact_to_mp(contact):
         "bearing": float(getattr(contact, "bearing", 0.0)),
         "detected": bool(getattr(contact, "detected", False)),
         "broadcasting": bool(getattr(contact, "broadcasting", False)),
+        "source": str(getattr(contact, "source", "") or ""),
+        "host_civilian_owner": str(getattr(contact, "host_civilian_owner", "") or ""),
         "internal_type": str(getattr(contact, "internal_type", "Unknown")),
         "internal_class": str(getattr(contact, "internal_class", "Unknown")),
         "classification_type": str(getattr(contact, "classification_type", "Unknown")),
@@ -11963,6 +12015,8 @@ def contact_from_mp_item(item, preserve_track=True):
         contact.track_number = int(item.get("track_number", contact.track_number))
     contact.detected = bool(item.get("detected", False))
     contact.broadcasting = bool(item.get("broadcasting", False))
+    contact.source = str(item.get("source", getattr(contact, "source", "")) or "")
+    contact.host_civilian_owner = str(item.get("host_civilian_owner", getattr(contact, "host_civilian_owner", "")) or "")
     contact.internal_type = str(item.get("internal_type", "Unknown"))
     contact.internal_class = str(item.get("internal_class", "Unknown"))
     contact.classification_type = str(item.get("classification_type", "Unknown"))
@@ -13634,6 +13688,8 @@ for sub_conf in config["submarines"]:  # note plural "submarines"
     if route_config is not None and configure_ship_route(submarine, route_config):
         apply_ship_route_elapsed_position(submarine)
     apply_saved_contact_state(submarine, sub_conf)
+    if getattr(submarine, "source", "") == "HostCivilian" and getattr(submarine, "host_civilian_owner", ""):
+        host_civilian_traffic_generated_origins.add(str(submarine.host_civilian_owner))
     contacts.append(submarine)
 
 update_all_contact_shadow_following()
@@ -14247,7 +14303,7 @@ while running:
                     continue
                 
                 if event.ui_element == row.define_contact_button:
-                    define_contact_from_row(row)
+                    define_contact_from_row(row, prompt_duplicate=False)
                     continue
 
         if event.type == pygame_gui.UI_BUTTON_PRESSED: # menu simulator button
@@ -14529,6 +14585,8 @@ while running:
                     if route_config is not None and configure_ship_route(submarine, route_config):
                         apply_ship_route_elapsed_position(submarine)
                     apply_saved_contact_state(submarine, sub_conf)
+                    if getattr(submarine, "source", "") == "HostCivilian" and getattr(submarine, "host_civilian_owner", ""):
+                        host_civilian_traffic_generated_origins.add(str(submarine.host_civilian_owner))
                     contacts.append(submarine)
 
                     if contact_define_row_array:
@@ -14557,12 +14615,17 @@ while running:
                     new_row.sub_depth_textbox.set_text(str(int(sub_conf["depth"])))
                     new_row.route_textbox.set_text(route_text_from_saved_config(sub_conf))
                     new_row.update_from_textboxes()
+                    new_row.defined_contact_track = getattr(submarine, "track_number", None)
                     new_row.update_route_visibility()
 
                 update_all_contact_shadow_following()
                 update_contact_define_scroll_area()
 
             if event.ui_element == start_button:
+                duplicate_row, duplicate_name = first_duplicate_contact_row()
+                if duplicate_row is not None:
+                    set_duplicate_contact_popup_visible(True, duplicate_row, duplicate_name)
+                    continue
                 update_multiplayer_settings_from_menu()
                 if multiplayer_role == "JOIN" and multiplayer_host_seen is None:
                     print("[MP] cannot start as JOIN: no host detected. Start one instance as HOST first.")

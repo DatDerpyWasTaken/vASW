@@ -11032,6 +11032,16 @@ def save_all_live_contacts_to_config(reason="autosave"):
         print(f"[SERVER] contact {reason} failed: could not read config.json: {exc}")
         return False
     entries = saved_config.setdefault("submarines", [])
+    live_names = {
+        str(getattr(contact, "name", "") or "").strip()
+        for contact in contacts
+        if str(getattr(contact, "name", "") or "").strip() and not is_dicass_ping_contact(contact)
+    }
+    entries[:] = [
+        entry
+        for entry in entries
+        if not isinstance(entry, dict) or not str(entry.get("name", "") or "").strip() or str(entry.get("name", "") or "").strip() in live_names
+    ]
     by_name = {str(entry.get("name", "")): entry for entry in entries if isinstance(entry, dict)}
     for contact in contacts:
         name = str(getattr(contact, "name", "") or "").strip()
@@ -11092,7 +11102,7 @@ def handle_server_command(line):
         return
     lower = line.lower()
     if lower in ("help", "?"):
-        print("[SERVER] commands: hdg <contact> <000>, spd <contact> <kts>, stop <contact>, <contact> shadow <target>, <contact> unshadow, save")
+        print("[SERVER] commands: hdg <contact> <000>, spd <contact> <kts>, stop <contact>, delete <contact>, <contact> shadow <target>, <contact> unshadow, save")
         return
     if lower == "save":
         save_all_live_contacts_to_config("manual save")
@@ -11137,6 +11147,16 @@ def handle_server_command(line):
             return
         request_ship_speed(contact, parts[-1])
         print(f"[SERVER] {contact.name} speed {parts[-1]}")
+        return
+    if len(parts) >= 2 and parts[0].lower() in ("delete", "del", "rm"):
+        contact = parse_server_contact_name(" ".join(parts[1:]))
+        if contact is None:
+            print("[SERVER] delete failed: contact not found")
+            return
+        contact_name = str(getattr(contact, "name", "Contact"))
+        delete_contact(contact)
+        save_all_live_contacts_to_config("delete")
+        print(f"[SERVER] deleted {contact_name}")
         return
     if len(parts) >= 2 and parts[0].lower() == "stop":
         contact = parse_server_contact_name(" ".join(parts[1:]))

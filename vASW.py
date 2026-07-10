@@ -137,6 +137,7 @@ CIVILIAN_TRAFFIC_GLOBAL_LAT_LIMIT = 72.0
 HOST_CIVILIAN_TRAFFIC_RADIUS_NM = 100.0
 HOST_CIVILIAN_TRAFFIC_TARGET_PER_PLAYER = 8
 HOST_CIVILIAN_TRAFFIC_REFRESH_SECONDS = 45.0
+MULTIPLAYER_CIVILIAN_CONTACT_RETENTION_SECONDS = 300.0
 host_civilian_traffic_last_update = 0.0
 host_civilian_traffic_generated_origins = set()
 aishub_last_fetch_at = 0.0
@@ -155,6 +156,7 @@ ship_waypoint_definition = None
 ship_motion_definition = None
 msfs_splash_effects = []
 msfs_splash_warning_shown = False
+msfs_connection_error_logged = False
 gaist_model_config = {}
 gaist_civilian_model_titles = None
 model_library_title_cache = {}
@@ -169,7 +171,7 @@ DIFAR_DETECTION_UPDATE_INTERVAL_SEC = 0.20
 DIFAR_HIDDEN_DETECTION_UPDATE_INTERVAL_SEC = 1.50
 DIFAR_DETECTION_UPDATE_JITTER_SEC = 0.45
 SOUND_SPEED_MPS = 1500.0
-APP_VERSION = "0.3.3"
+APP_VERSION = "0.3.4"
 GITHUB_OWNER = "DatDerpyWasTaken"
 GITHUB_REPO = "vASW"
 GITHUB_RELEASE_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
@@ -216,6 +218,7 @@ multiplayer_last_state_broadcast = 0.0
 multiplayer_last_contact_contribution = 0.0
 multiplayer_host_seen = None
 multiplayer_peers = {}
+multiplayer_recently_lost_peers = {}
 multiplayer_channel_assignments = {}
 multiplayer_contact_password = ""
 server_contact_autosave_last = 0.0
@@ -493,20 +496,30 @@ def msfs_splash_model_title():
 
 
 def ensure_msfs_connection():
-    global sm, aq
+    global sm, aq, msfs_connection_error_logged
 
     if "sm" in globals() and sm is not None:
         return True
+
+    if DEDICATED_HOST_MODE or os.name != "nt":
+        if not msfs_connection_error_logged:
+            print("MSFS SimConnect unavailable on this host; skipping MSFS object injection.")
+            msfs_connection_error_logged = True
+        sm = None
+        aq = None
+        return False
 
     try:
         sm = SimConnect()
         aq = AircraftRequests(sm, _time=2000)
         return True
-    except ConnectionError:
+    except (ConnectionError, OSError, AttributeError, NameError) as exc:
+        if not msfs_connection_error_logged:
+            print(f"MSFS SimConnect unavailable: {exc}")
+            msfs_connection_error_logged = True
         sm = None
         aq = None
         return False
-
 
 def ship_sim_speed_kts(contact):
     return max(0.0, float(getattr(contact, "speed", 0) or 0) * ship_visual_speed_multiplier)
@@ -4656,6 +4669,7 @@ def set_multiplayer_role(role):
     multiplayer_role = role if role in ("OFF", "SERVER", "HOST", "JOIN") else "OFF"
     multiplayer_enabled = multiplayer_role != "OFF"
     multiplayer_peers.clear()
+    multiplayer_recently_lost_peers.clear()
     if multiplayer_role == "OFF":
         multiplayer_host_seen = None
         close_multiplayer_socket()
@@ -8976,7 +8990,16 @@ def generate_dynamic_civilian_traffic(count=24, origin=None):
     return created_contacts
 
 
-def multiplayer_player_traffic_origins():
+def cleanup_recently_lost_multiplayer_peers(now=None):
+    if now is None:
+        now = time.time()
+    for peer_id, peer in list(multiplayer_recently_lost_peers.items()):
+        if now - float(peer.get("lost_at", now) or now) > MULTIPLAYER_CIVILIAN_CONTACT_RETENTION_SECONDS:
+            multiplayer_recently_lost_peers.pop(peer_id, None)
+
+
+def multiplayer_player_traffic_origins(include_recently_lost=False):
+    cleanup_recently_lost_multiplayer_peers()
     origins = []
     own_latlon = None if DEDICATED_HOST_MODE else (current_player_lat_lon_for_mp() if "current_player_lat_lon_for_mp" in globals() else None)
     if own_latlon is not None:
@@ -8984,7 +9007,8 @@ def multiplayer_player_traffic_origins():
             "id": MULTIPLAYER_ID,
             "label": MULTIPLAYER_CALLSIGN,
             "lat": float(own_latlon[0]),
-            "lon": float(own_latlon[1])
+            "lon": float(own_latlon[1]),
+            "active": True
         })
     for peer in multiplayer_peers.values():
         try:
@@ -8992,12 +9016,28 @@ def multiplayer_player_traffic_origins():
                 "id": str(peer.get("id", "")),
                 "label": str(peer.get("callsign", "MP")),
                 "lat": float(peer.get("lat")),
-                "lon": float(peer.get("lon"))
+                "lon": float(peer.get("lon")),
+                "active": True
             })
         except (TypeError, ValueError):
             continue
+    if include_recently_lost:
+        active_ids = {str(origin.get("id", "")) for origin in origins}
+        for peer_id, peer in multiplayer_recently_lost_peers.items():
+            if peer_id in active_ids:
+                continue
+            try:
+                origins.append({
+                    "id": str(peer_id),
+                    "label": str(peer.get("callsign", "MP")),
+                    "lat": float(peer.get("lat")),
+                    "lon": float(peer.get("lon")),
+                    "active": False,
+                    "lost_at": float(peer.get("lost_at", 0.0) or 0.0)
+                })
+            except (TypeError, ValueError):
+                continue
     return origins
-
 
 def contact_within_any_origin(contact, origins, radius_nm):
     for origin in origins:
@@ -9038,31 +9078,38 @@ def update_host_civilian_traffic(force=False):
     if not force and now - host_civilian_traffic_last_update < HOST_CIVILIAN_TRAFFIC_REFRESH_SECONDS:
         return 0
     host_civilian_traffic_last_update = now
+    cleanup_recently_lost_multiplayer_peers(now)
 
-    origins = multiplayer_player_traffic_origins()
-    if not origins:
+    active_origins = multiplayer_player_traffic_origins(include_recently_lost=False)
+    retained_origins = multiplayer_player_traffic_origins(include_recently_lost=True)
+    if not active_origins and not retained_origins:
+        before_count = len(contacts)
+        contacts[:] = [contact for contact in contacts if getattr(contact, "source", "") != "HostCivilian"]
+        removed = before_count - len(contacts)
+        if removed:
+            multiplayer_last_state_broadcast = 0.0
+            print(f"[HOST] civilian traffic: +0, -{removed}, no retained player areas")
         return 0
 
     before_count = len(contacts)
     contacts[:] = [
         contact for contact in contacts
         if getattr(contact, "source", "") != "HostCivilian" or
-        contact_within_any_origin(contact, origins, HOST_CIVILIAN_TRAFFIC_RADIUS_NM * 1.15)
+        contact_within_any_origin(contact, retained_origins, HOST_CIVILIAN_TRAFFIC_RADIUS_NM * 1.15)
     ]
 
     created = 0
     start_number = len([contact for contact in contacts if getattr(contact, "internal_class", "") == "Civilian"]) + 1
-    for origin in origins:
+    for origin in active_origins:
         origin_id = str(origin.get("id", ""))
         if not origin_id:
             continue
         nearby = [
             contact for contact in contacts
-            if getattr(contact, "source", "") == "HostCivilian" and
-            str(getattr(contact, "host_civilian_owner", "")) == origin_id
+            if contact_is_civilian_surface(contact) and
+            (getattr(contact, "source", "") == "HostCivilian" or getattr(contact, "mp_contributed", False)) and
+            haversine(origin["lat"], origin["lon"], contact.contact_lat, contact.contact_long) <= HOST_CIVILIAN_TRAFFIC_RADIUS_NM
         ]
-        if origin_id in host_civilian_traffic_generated_origins:
-            continue
         needed = max(0, HOST_CIVILIAN_TRAFFIC_TARGET_PER_PLAYER - len(nearby))
         made_for_origin = 0
         for _ in range(needed):
@@ -9078,9 +9125,8 @@ def update_host_civilian_traffic(force=False):
     removed = before_count + created - len(contacts)
     if created or removed:
         multiplayer_last_state_broadcast = 0.0
-        print(f"[HOST] civilian traffic: +{created}, -{removed}, {len(origins)} player areas within {HOST_CIVILIAN_TRAFFIC_RADIUS_NM:.0f} NM")
+        print(f"[HOST] civilian traffic: +{created}, -{removed}, {len(active_origins)} active player areas, {len(retained_origins) - len(active_origins)} retained stale areas")
     return created
-
 
 def generate_random_whales(count=None, origin=None):
     if count is None:
@@ -12064,6 +12110,9 @@ def apply_multiplayer_contact_contribution(packet):
         return
 
     source_id = str(packet.get("id", ""))
+    if not source_id:
+        return
+    multiplayer_recently_lost_peers.pop(source_id, None)
     updated = 0
     created = 0
     for item in packet.get("contacts", []):
@@ -12096,6 +12145,28 @@ def apply_multiplayer_contact_contribution(packet):
         multiplayer_last_state_broadcast = 0.0
         print(f"[MP] accepted contact contribution from {packet.get('callsign', source_id)}: +{created}, updated {updated}")
 
+
+def prune_stale_multiplayer_contributed_contacts(now=None):
+    global multiplayer_last_state_broadcast
+    if now is None:
+        now = time.time()
+    cleanup_recently_lost_multiplayer_peers(now)
+    retained_source_ids = {MULTIPLAYER_ID}
+    retained_source_ids.update(str(peer_id) for peer_id in multiplayer_peers.keys())
+    retained_source_ids.update(str(peer_id) for peer_id in multiplayer_recently_lost_peers.keys())
+
+    before_count = len(contacts)
+    contacts[:] = [
+        contact for contact in contacts
+        if not getattr(contact, "mp_contributed", False) or
+        not str(getattr(contact, "mp_source_id", "") or "") or
+        str(getattr(contact, "mp_source_id", "") or "") in retained_source_ids
+    ]
+    removed = before_count - len(contacts)
+    if removed:
+        multiplayer_last_state_broadcast = 0.0
+        print(f"[MP] removed {removed} stale contributed contacts")
+    return removed
 
 def send_multiplayer_contact_contribution():
     if multiplayer_role != "JOIN" or multiplayer_host_seen is None or not multiplayer_contact_password_ok():
@@ -12896,6 +12967,7 @@ def update_multiplayer():
         except (KeyError, TypeError, ValueError):
             continue
 
+        multiplayer_recently_lost_peers.pop(peer["id"], None)
         first_seen = peer["id"] not in multiplayer_peers
         multiplayer_peers[peer["id"]] = peer
         if first_seen:
@@ -12907,10 +12979,17 @@ def update_multiplayer():
     for peer_id, peer in list(multiplayer_peers.items()):
         if now - peer.get("last_seen", 0) > MULTIPLAYER_STALE_SECONDS:
             print(f"[MP] lost aircraft {peer.get('callsign', peer_id)}")
+            lost_peer = dict(peer)
+            lost_peer["lost_at"] = float(peer.get("last_seen", now) or now)
+            multiplayer_recently_lost_peers[peer_id] = lost_peer
             multiplayer_peers.pop(peer_id, None)
             if multiplayer_is_host_role():
                 update_multiplayer_channel_assignments()
                 multiplayer_last_state_broadcast = 0.0
+
+
+    if multiplayer_is_host_role():
+        prune_stale_multiplayer_contributed_contacts(now)
 
     if multiplayer_host_seen and now - multiplayer_host_seen.get("last_seen", 0) > MULTIPLAYER_STALE_SECONDS:
         if multiplayer_role == "JOIN":

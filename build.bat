@@ -20,6 +20,7 @@ python -m PyInstaller ^
   --clean ^
   -D ^
   --name vASW ^
+  --icon "assets\vasw_icon.ico" ^
   --contents-directory . ^
   --add-data "config.json;." ^
   --add-data "gaist_models.json;." ^

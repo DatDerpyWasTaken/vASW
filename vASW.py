@@ -171,13 +171,19 @@ DIFAR_DETECTION_UPDATE_INTERVAL_SEC = 0.20
 DIFAR_HIDDEN_DETECTION_UPDATE_INTERVAL_SEC = 1.50
 DIFAR_DETECTION_UPDATE_JITTER_SEC = 0.45
 SOUND_SPEED_MPS = 1500.0
-APP_VERSION = "0.3.4"
+APP_VERSION = "0.3.5"
 GITHUB_OWNER = "DatDerpyWasTaken"
 GITHUB_REPO = "vASW"
 GITHUB_RELEASE_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 UPDATE_ASSET_KEYWORDS = ("windows", "win", "vASW")
 
 MULTIPLAYER_PORT = 51423
+MULTIPLAYER_SERVER_HOST = ''
+for index, arg in enumerate(sys.argv[1:]):
+    if arg.lower() in ("--server-host", "--host-ip", "--connect") and index + 2 <= len(sys.argv[1:]):
+        MULTIPLAYER_SERVER_HOST = sys.argv[index + 2].strip()
+        break
+MULTIPLAYER_SERVER_HOST = os.environ.get("VASW_SERVER_HOST", MULTIPLAYER_SERVER_HOST).strip()
 MULTIPLAYER_BROADCAST_INTERVAL = 0.25
 MULTIPLAYER_STATE_BROADCAST_INTERVAL = 1.0
 MULTIPLAYER_STALE_SECONDS = 8.0
@@ -1652,23 +1658,78 @@ INTERNAL_HEIGHT = 1080
 internal_surface = pygame.Surface((INTERNAL_WIDTH, INTERNAL_HEIGHT))
 font = pygame.font.SysFont("mono", 12,bold=False)
 info = pygame.display.Info()
-screen_height = 1080
-screen_width = 1920
+def smallest_monitor_work_area():
+    """Return the smallest Windows monitor work area, if it is available."""
+    if sys.platform != "win32":
+        return None
+
+    class Rect(ctypes.Structure):
+        _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                    ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+    class MonitorInfo(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", Rect),
+                    ("rcWork", Rect), ("dwFlags", ctypes.c_ulong)]
+
+    areas = []
+    callback_type = ctypes.WINFUNCTYPE(
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(Rect), ctypes.c_void_p
+    )
+
+    def collect_monitor(monitor, _device_context, _monitor_rect, _user_data):
+        monitor_info = MonitorInfo()
+        monitor_info.cbSize = ctypes.sizeof(MonitorInfo)
+        if ctypes.windll.user32.GetMonitorInfoW(monitor, ctypes.byref(monitor_info)):
+            work = monitor_info.rcWork
+            areas.append((work.left, work.top, work.right - work.left, work.bottom - work.top))
+        return 1
+
+    try:
+        ctypes.windll.user32.EnumDisplayMonitors(None, None, callback_type(collect_monitor), None)
+    except Exception:
+        return None
+    return min(areas, key=lambda area: area[2] * area[3]) if areas else None
+
+
+# Pick a safe initial position and size from the smallest monitor's *work
+# area* (which excludes the taskbar). This affects launch only: once open, the
+# user can move, resize, maximise, or fullscreen the window on any monitor.
+work_area = smallest_monitor_work_area()
+if work_area is not None:
+    work_left, work_top, work_width, work_height = work_area
+    screen_width = min(INTERNAL_WIDTH, max(320, work_width - 32))
+    screen_height = min(INTERNAL_HEIGHT, max(240, work_height - 64))
+    MIN_WINDOW_WIDTH = min(960, screen_width)
+    MIN_WINDOW_HEIGHT = min(540, screen_height)
+    os.environ["SDL_VIDEO_WINDOW_POS"] = f"{work_left + 16},{work_top + 16}"
+else:
+    screen_width, screen_height = INTERNAL_WIDTH, INTERNAL_HEIGHT
+    MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT = 960, 540
 screen = pygame.display.set_mode((screen_width, screen_height), pygame.RESIZABLE)
+pygame.display.set_caption("vASW")
+try:
+    pygame.display.set_icon(pygame.image.load("assets/vasw_icon.png"))
+except pygame.error:
+    pass
 display_scale = 1.0
+display_scale_x = 1.0
+display_scale_y = 1.0
 display_viewport_rect = pygame.Rect(0, 0, INTERNAL_WIDTH, INTERNAL_HEIGHT)
 
 
 def update_display_viewport():
-    global display_scale, display_viewport_rect
+    global display_scale, display_scale_x, display_scale_y, display_viewport_rect
+    # Preserve the 1920x1080 canvas aspect ratio. The unused area is filled
+    # black, rather than stretching or compressing the map and menu.
     display_scale = min(screen_width / INTERNAL_WIDTH, screen_height / INTERNAL_HEIGHT)
+    display_scale_x = display_scale_y = display_scale
     viewport_w = max(1, int(INTERNAL_WIDTH * display_scale))
     viewport_h = max(1, int(INTERNAL_HEIGHT * display_scale))
     display_viewport_rect = pygame.Rect(
         (screen_width - viewport_w) // 2,
         (screen_height - viewport_h) // 2,
         viewport_w,
-        viewport_h
+        viewport_h,
     )
 
 
@@ -1695,7 +1756,7 @@ sonoS_surface = pygame.transform.scale(sonoS_surfacea, new_size)
 sonoD_surface = pygame.transform.scale(sonoD_surfacea, new_size)
 unknown_contact_surface = pygame.transform.scale(unknown_contact_surfacea, new_size)
 sub_surface = pygame.transform.scale(sub_surfacea, new_size)
-menu_surface = pygame.Surface((screen_width,screen_height), pygame.SRCALPHA)
+menu_surface = pygame.Surface((INTERNAL_WIDTH, INTERNAL_HEIGHT), pygame.SRCALPHA)
 
 
 
@@ -1752,13 +1813,16 @@ def register_ui_element(element, base_rect):
 
 
 def point_over_visible_ui(screen_pos):
+    # pygame_gui now lives on the fixed-size internal canvas. Convert the
+    # physical mouse position before comparing it with its logical rects.
+    ui_pos = internal_mouse_pos(screen_pos) if "internal_mouse_pos" in globals() else screen_pos
     for element, _ in list(ui_elements):
         try:
             if hasattr(element, "alive") and not element.alive():
                 continue
             if hasattr(element, "visible") and not element.visible:
                 continue
-            if hasattr(element, "rect") and element.rect.collidepoint(screen_pos):
+            if hasattr(element, "rect") and element.rect.collidepoint(ui_pos):
                 return True
         except Exception:
             continue
@@ -1818,7 +1882,7 @@ def scroll_contact_define_container(wheel_steps, mouse_pos=None):
     if not getattr(contact_panel, "visible", True):
         return False
 
-    mouse_pos = mouse_pos or pygame.mouse.get_pos()
+    mouse_pos = internal_mouse_pos(mouse_pos or pygame.mouse.get_pos())
     if not contact_panel.rect.collidepoint(mouse_pos):
         return False
 
@@ -2585,30 +2649,28 @@ def sync_display_mode_control_visibility():
 
 def scale_rect(base_rect, screen, base_width=1920, base_height=1080):
     """
-    Takes a rect designed for 1920x1080 and maps it into the current viewport.
+    Return a logical 1920x1080 UI rect. pygame_gui is composed onto the
+    internal canvas and the complete frame is scaled only at presentation.
     """
-    return internal_rect_to_screen_rect(base_rect)
+    return pygame.Rect(base_rect)
 
 
 SETTINGS_RESOLUTION_OPTIONS = [
-    "16:9 1920x1080",
-    "16:9 1600x900",
-    "16:9 1280x720",
-    "16:10 1680x1050",
-    "4:3 1440x1080",
-    "21:9 1920x823"
+    "1920x1080",
+    "1600x900",
+    "1280x720"
 ]
 SETTINGS_RESOLUTION_SIZES = {
-    "16:9 1920x1080": (1920, 1080),
-    "16:9 1600x900": (1600, 900),
-    "16:9 1280x720": (1280, 720),
-    "16:10 1680x1050": (1680, 1050),
-    "4:3 1440x1080": (1440, 1080),
-    "21:9 1920x823": (1920, 823)
+    "1920x1080": (1920, 1080),
+    "1600x900": (1600, 900),
+    "1280x720": (1280, 720)
 }
 SETTINGS_SOUND_OPTIONS = ["100%", "75%", "50%", "25%", "0%"]
+SETTINGS_WINDOW_MODE_OPTIONS = ["Windowed", "Fullscreen"]
 master_sound_level = 1.0
 settings_panel_visible = False
+settings_window_mode = "Windowed"
+windowed_screen_size = (screen_width, screen_height)
 
 
 settings_button = pygame_gui.elements.UIButton(
@@ -2618,7 +2680,7 @@ settings_button = pygame_gui.elements.UIButton(
     tool_tip_text="Settings"
 )
 settings_panel = pygame_gui.elements.UIPanel(
-    relative_rect=scale_rect(pygame.Rect((1510, 48), (400, 300)), screen),
+    relative_rect=scale_rect(pygame.Rect((1510, 48), (400, 340)), screen),
     manager=manager
 )
 settings_title = pygame_gui.elements.UILabel(
@@ -2638,7 +2700,7 @@ settings_resolution_label = pygame_gui.elements.UILabel(
 )
 settings_resolution_dropdown = pygame_gui.elements.UIDropDownMenu(
     options_list=SETTINGS_RESOLUTION_OPTIONS,
-    starting_option="16:9 1920x1080",
+    starting_option="1920x1080",
     relative_rect=scale_rect(pygame.Rect((1640, 90), (236, 28)), screen),
     manager=manager
 )
@@ -2696,14 +2758,25 @@ settings_status_label = pygame_gui.elements.UILabel(
     manager=manager
 )
 settings_update_button = pygame_gui.elements.UIButton(
-    relative_rect=scale_rect(pygame.Rect((1524, 282), (116, 28)), screen),
+    relative_rect=scale_rect(pygame.Rect((1524, 320), (116, 28)), screen),
     text="UPDATE",
     manager=manager,
     tool_tip_text="Check GitHub Releases and install the latest vASW build."
 )
 settings_update_status_label = pygame_gui.elements.UILabel(
-    relative_rect=scale_rect(pygame.Rect((1650, 282), (246, 28)), screen),
+    relative_rect=scale_rect(pygame.Rect((1650, 320), (246, 28)), screen),
     text="GitHub releases",
+    manager=manager
+)
+settings_window_mode_label = pygame_gui.elements.UILabel(
+    relative_rect=scale_rect(pygame.Rect((1524, 282), (110, 24)), screen),
+    text="DISPLAY",
+    manager=manager
+)
+settings_window_mode_dropdown = pygame_gui.elements.UIDropDownMenu(
+    options_list=SETTINGS_WINDOW_MODE_OPTIONS,
+    starting_option=settings_window_mode,
+    relative_rect=scale_rect(pygame.Rect((1640, 280), (236, 28)), screen),
     manager=manager
 )
 settings_elements = [
@@ -2723,11 +2796,13 @@ settings_elements = [
     settings_version_label,
     settings_status_label,
     settings_update_button,
-    settings_update_status_label
+    settings_update_status_label,
+    settings_window_mode_label,
+    settings_window_mode_dropdown
 ]
 
 register_ui_element(settings_button, pygame.Rect((1868, 8), (42, 30)))
-register_ui_element(settings_panel, pygame.Rect((1510, 48), (400, 300)))
+register_ui_element(settings_panel, pygame.Rect((1510, 48), (400, 340)))
 register_ui_element(settings_title, pygame.Rect((1524, 56), (260, 24)))
 register_ui_element(settings_close_button, pygame.Rect((1846, 56), (50, 24)))
 register_ui_element(settings_resolution_label, pygame.Rect((1524, 92), (110, 24)))
@@ -2742,8 +2817,10 @@ register_ui_element(settings_aircraft_label, pygame.Rect((1524, 244), (110, 24))
 register_ui_element(settings_aircraft_dropdown, pygame.Rect((1640, 242), (120, 28)))
 register_ui_element(settings_version_label, pygame.Rect((1770, 204), (126, 28)))
 register_ui_element(settings_status_label, pygame.Rect((1770, 242), (126, 28)))
-register_ui_element(settings_update_button, pygame.Rect((1524, 282), (116, 28)))
-register_ui_element(settings_update_status_label, pygame.Rect((1650, 282), (246, 28)))
+register_ui_element(settings_window_mode_label, pygame.Rect((1524, 282), (110, 24)))
+register_ui_element(settings_window_mode_dropdown, pygame.Rect((1640, 280), (236, 28)))
+register_ui_element(settings_update_button, pygame.Rect((1524, 320), (116, 28)))
+register_ui_element(settings_update_status_label, pygame.Rect((1650, 320), (246, 28)))
 
 update_popup_visible = False
 update_popup_release = None
@@ -3018,6 +3095,7 @@ def set_settings_panel_visible(visible):
 
 def sync_settings_fields():
     settings_simulator_dropdown.selected_option = "X-Plane" if xplane == 1 else "MSFS"
+    settings_window_mode_dropdown.selected_option = settings_window_mode
     settings_callsign_entry.set_text(MULTIPLAYER_CALLSIGN)
     settings_version_label.set_text(f"v{APP_VERSION}")
     settings_status_label.set_text(f"{MULTIPLAYER_CALLSIGN} {multiplayer_platform_label()}")
@@ -3034,16 +3112,34 @@ def apply_sound_level(option):
 
 
 def apply_resolution_option(option):
-    global screen_width, screen_height, screen
+    global screen_width, screen_height, screen, windowed_screen_size
     width, height = SETTINGS_RESOLUTION_SIZES.get(str(option), (screen_width, screen_height))
+    windowed_screen_size = (width, height)
     screen_width, screen_height = width, height
-    screen = pygame.display.set_mode((screen_width, screen_height), pygame.RESIZABLE)
+    flags = pygame.FULLSCREEN if settings_window_mode == "Fullscreen" else pygame.RESIZABLE
+    screen = pygame.display.set_mode((screen_width, screen_height), flags)
+    pygame.display.set_caption("vASW")
     update_display_viewport()
-    manager.set_window_resolution((screen_width, screen_height))
-    refresh_resolution_dependent_fonts()
-    resize_ui(screen_width, screen_height)
-    layout_top_mode_buttons(screen_width, screen_height)
-    sync_stateful_button_styles()
+    # The GUI is rendered onto internal_surface at 1920x1080, then scaled as
+    # one image with the rest of the application. Keeping this resolution
+    # fixed preserves every parent/child layout relationship.
+    radar_terrain_cache["key"] = None
+
+
+def apply_window_mode(option):
+    """Switch display mode while preserving the user's windowed resolution."""
+    global settings_window_mode, screen_width, screen_height, screen, windowed_screen_size
+    settings_window_mode = "Fullscreen" if str(option) == "Fullscreen" else "Windowed"
+    if settings_window_mode == "Fullscreen":
+        windowed_screen_size = (screen_width, screen_height)
+        desktop = pygame.display.Info()
+        screen_width, screen_height = desktop.current_w, desktop.current_h
+        screen = pygame.display.set_mode((screen_width, screen_height), pygame.FULLSCREEN)
+    else:
+        screen_width, screen_height = windowed_screen_size
+        screen = pygame.display.set_mode((screen_width, screen_height), pygame.RESIZABLE)
+    pygame.display.set_caption("vASW")
+    update_display_viewport()
     radar_terrain_cache["key"] = None
 
 
@@ -3074,6 +3170,7 @@ def set_simulator_mode(mode):
 
 
 set_settings_panel_visible(False)
+settings_button.hide()
 
 # ---------------------------------------------------------------------------
 # Menu/config state
@@ -3404,6 +3501,8 @@ def set_menu_visible(visible):
         refresh_control_contact_dropdown()
         update_multiplayer_platform_selector_visibility()
         multiplayer_status_label.show()
+        settings_button.hide()
+        set_settings_panel_visible(False)
         map_mode_button.hide()
         radar_mode_button.hide()
         nav_mode_button.hide()
@@ -3458,6 +3557,7 @@ def set_menu_visible(visible):
         multiplayer_password_entry.hide()
         multiplayer_contact_dropdown.hide()
         multiplayer_status_label.hide()
+        settings_button.show()
         map_mode_button.show()
         radar_mode_button.show()
         nav_mode_button.show()
@@ -4507,9 +4607,8 @@ def set_registered_ui_base_rect(element, base_rect):
             break
     else:
         register_ui_element(element, base_rect.copy())
-    scaled_rect = internal_rect_to_screen_rect(base_rect)
-    element.set_relative_position((scaled_rect.x, scaled_rect.y))
-    element.set_dimensions((scaled_rect.w, scaled_rect.h))
+    element.set_relative_position(base_rect.topleft)
+    element.set_dimensions(base_rect.size)
 
 
 def multiplayer_platform_selector_rect():
@@ -4566,7 +4665,7 @@ def refresh_control_contact_dropdown(selected=None):
         return
     visible = getattr(multiplayer_contact_dropdown, "visible", False)
     base_rect = multiplayer_platform_selector_rect()
-    rect = internal_rect_to_screen_rect(base_rect)
+    rect = base_rect
     ui_elements[:] = [item for item in ui_elements if item[0] is not multiplayer_contact_dropdown]
     multiplayer_contact_dropdown.kill()
     ownship_control_contact_options = options
@@ -4678,6 +4777,7 @@ def set_multiplayer_role(role):
         if multiplayer_role == "JOIN":
             multiplayer_host_seen = None
         ensure_multiplayer_socket()
+        seed_direct_multiplayer_host()
         label = "server" if multiplayer_role == "SERVER" else multiplayer_role.lower()
         print(f"[MP] {label} mode as {MULTIPLAYER_CALLSIGN} ({MULTIPLAYER_AIRCRAFT_TYPE})")
     if "update_multiplayer_channel_assignments" in globals():
@@ -4871,6 +4971,11 @@ nav_route_status_label = pygame_gui.elements.UILabel(
     text="No route",
     manager=manager
 )
+nav_close_button = pygame_gui.elements.UIButton(
+    relative_rect=pygame.Rect((1745, 184), (135, 30)),
+    text="CLOSE NAV",
+    manager=manager
+)
 nav_elements = [
     nav_heading_label,
     nav_heading_entry,
@@ -4880,7 +4985,8 @@ nav_elements = [
     nav_depth_entry,
     nav_route_entry,
     nav_import_route_button,
-    nav_route_status_label
+    nav_route_status_label,
+    nav_close_button
 ]
 for element in nav_elements:
     element.hide()
@@ -4923,6 +5029,7 @@ register_ui_element(nav_depth_entry, nav_depth_entry.relative_rect)
 register_ui_element(nav_route_entry, nav_route_entry.relative_rect)
 register_ui_element(nav_import_route_button, nav_import_route_button.relative_rect)
 register_ui_element(nav_route_status_label, nav_route_status_label.relative_rect)
+register_ui_element(nav_close_button, nav_close_button.relative_rect)
 layout_top_mode_buttons(screen_width, screen_height)
 sync_stateful_button_styles()
 sync_bearing_lines_button_style()
@@ -6062,6 +6169,22 @@ def internal_mouse_pos(screen_pos):
     x = (screen_pos[0] - display_viewport_rect.x) / max(0.0001, display_scale)
     y = (screen_pos[1] - display_viewport_rect.y) / max(0.0001, display_scale)
     return pygame.Vector2(x, y)
+
+
+def ui_event_for_internal_canvas(event):
+    """Map pointer event coordinates to pygame_gui's 1920x1080 canvas."""
+    if not hasattr(event, "pos"):
+        return event
+
+    event_data = dict(event.dict)
+    position = internal_mouse_pos(event.pos)
+    event_data["pos"] = (round(position.x), round(position.y))
+    if "rel" in event_data:
+        event_data["rel"] = (
+            round(event_data["rel"][0] / max(0.0001, display_scale)),
+            round(event_data["rel"][1] / max(0.0001, display_scale)),
+        )
+    return pygame.event.Event(event.type, event_data)
 
 
 def find_contact_at_internal_pos(internal_pos):
@@ -11319,7 +11442,7 @@ def clamp_float(value, default, minimum=None, maximum=None):
 
 
 def update_nav_control_visibility():
-    visible = (display_mode == "NAV")
+    visible = (not in_menu and display_mode == "NAV")
     for element in nav_elements:
         if visible:
             element.show()
@@ -11622,7 +11745,7 @@ def dispatch_search_pattern_launch_action(action):
         if sock is None or multiplayer_host_seen is None:
             return False
         try:
-            sock.sendto(json.dumps(action).encode("utf-8"), ("255.255.255.255", MULTIPLAYER_PORT))
+            send_multiplayer_payload(sock, json.dumps(action).encode("utf-8"), "launch request")
             return True
         except OSError as exc:
             print(f"[MP] auto buoy launch request failed: {exc}")
@@ -11986,6 +12109,65 @@ def ensure_multiplayer_socket():
     return multiplayer_socket
 
 
+def multiplayer_configured_server_addr():
+    if not MULTIPLAYER_SERVER_HOST:
+        return None
+    return (MULTIPLAYER_SERVER_HOST, MULTIPLAYER_PORT)
+
+
+def multiplayer_packet_targets(include_peers=False):
+    targets = []
+    direct_server = multiplayer_configured_server_addr()
+    if direct_server and multiplayer_role == "JOIN":
+        targets.append(direct_server)
+    else:
+        targets.append(("255.255.255.255", MULTIPLAYER_PORT))
+
+    if include_peers and multiplayer_is_host_role():
+        for peer in multiplayer_peers.values():
+            addr = peer.get("addr")
+            if addr:
+                targets.append((addr, MULTIPLAYER_PORT))
+
+    unique_targets = []
+    seen = set()
+    for target in targets:
+        if target not in seen:
+            seen.add(target)
+            unique_targets.append(target)
+    return unique_targets
+
+
+def send_multiplayer_payload(sock, payload, description="packet", include_peers=False):
+    sent = False
+    last_error = None
+    for target in multiplayer_packet_targets(include_peers=include_peers):
+        try:
+            sock.sendto(payload, target)
+            sent = True
+        except OSError as exc:
+            last_error = exc
+    if not sent and last_error is not None:
+        print(f"[MP] {description} failed: {last_error}")
+    return sent
+
+
+def seed_direct_multiplayer_host():
+    global multiplayer_host_seen
+    if multiplayer_role != "JOIN" or not MULTIPLAYER_SERVER_HOST or multiplayer_host_seen is not None:
+        return
+    multiplayer_host_seen = {
+        "id": "direct-server",
+        "callsign": "SERVER",
+        "aircraft_type": "ASW",
+        "password_required": True,
+        "addr": MULTIPLAYER_SERVER_HOST,
+        "last_seen": time.time()
+    }
+    print(f"[MP] using direct host {MULTIPLAYER_SERVER_HOST}:{MULTIPLAYER_PORT}")
+
+
+
 def multiplayer_host_packet():
     return {
         "kind": "vASW-host",
@@ -12177,7 +12359,7 @@ def send_multiplayer_contact_contribution():
     if sock is None:
         return False
     try:
-        sock.sendto(json.dumps(multiplayer_contact_contribution_packet()).encode("utf-8"), ("255.255.255.255", MULTIPLAYER_PORT))
+        send_multiplayer_payload(sock, json.dumps(multiplayer_contact_contribution_packet()).encode("utf-8"), "contact contribution")
         return True
     except OSError as exc:
         print(f"[MP] contact contribution failed: {exc}")
@@ -12550,7 +12732,7 @@ def send_multiplayer_contact_command(command, contact=None, **payload):
     if multiplayer_contact_password:
         packet["password"] = multiplayer_contact_password
     try:
-        sock.sendto(json.dumps(packet).encode("utf-8"), ("255.255.255.255", MULTIPLAYER_PORT))
+        send_multiplayer_payload(sock, json.dumps(packet).encode("utf-8"), "contact command")
         return True
     except OSError as exc:
         print(f"[MP] contact command failed: {exc}")
@@ -12595,7 +12777,7 @@ def send_multiplayer_launch_request():
         "timestamp": time.time()
     }
     try:
-        sock.sendto(json.dumps(action).encode("utf-8"), ("255.255.255.255", MULTIPLAYER_PORT))
+        send_multiplayer_payload(sock, json.dumps(action).encode("utf-8"), "launch request")
         print(f"[MP] requested host launch: {sono_selection}")
         return True
     except OSError as exc:
@@ -12864,11 +13046,12 @@ def update_multiplayer():
         return
 
     now = time.time()
+    seed_direct_multiplayer_host()
     if multiplayer_is_host_role() and now - multiplayer_last_host_broadcast >= MULTIPLAYER_BROADCAST_INTERVAL:
         multiplayer_last_host_broadcast = now
         try:
             payload = json.dumps(multiplayer_host_packet()).encode("utf-8")
-            sock.sendto(payload, ("255.255.255.255", MULTIPLAYER_PORT))
+            send_multiplayer_payload(sock, payload, "multiplayer packet", include_peers=True)
         except OSError as exc:
             print(f"[MP] host beacon failed: {exc}")
 
@@ -12880,7 +13063,7 @@ def update_multiplayer():
         multiplayer_last_broadcast = now
         try:
             payload = json.dumps(multiplayer_packet()).encode("utf-8")
-            sock.sendto(payload, ("255.255.255.255", MULTIPLAYER_PORT))
+            send_multiplayer_payload(sock, payload, "multiplayer packet", include_peers=True)
         except OSError as exc:
             print(f"[MP] broadcast failed: {exc}")
 
@@ -12892,7 +13075,7 @@ def update_multiplayer():
         multiplayer_last_state_broadcast = now
         try:
             payload = json.dumps(multiplayer_state_packet()).encode("utf-8")
-            sock.sendto(payload, ("255.255.255.255", MULTIPLAYER_PORT))
+            send_multiplayer_payload(sock, payload, "multiplayer packet", include_peers=True)
         except OSError as exc:
             print(f"[MP] state sync failed: {exc}")
 
@@ -13802,6 +13985,7 @@ if DEDICATED_HOST_MODE:
 #   2. process pygame/pygame_gui events
 #   3. update sonar/contact state
 #   4. draw map, overlays, spectrograms, and UI
+set_menu_visible(True)
 while running:
     process_server_commands()
     maybe_server_contact_autosave()
@@ -13884,14 +14068,15 @@ while running:
         if event.type == pygame.QUIT:
             running = False
         elif event.type == pygame.VIDEORESIZE:
-            screen_width, screen_height = max(640, event.w), max(360, event.h)
+            if settings_window_mode == "Fullscreen":
+                continue
+            # Do not shrink below the readable menu size (or the smallest
+            # monitor's available work area, if that is smaller).
+            screen_width, screen_height = max(MIN_WINDOW_WIDTH, event.w), max(MIN_WINDOW_HEIGHT, event.h)
+            windowed_screen_size = (screen_width, screen_height)
             screen = pygame.display.set_mode((screen_width, screen_height), pygame.RESIZABLE)
+            pygame.display.set_caption("vASW")
             update_display_viewport()
-            manager.set_window_resolution((screen_width, screen_height))
-            refresh_resolution_dependent_fonts()
-            resize_ui(screen_width, screen_height)
-            layout_top_mode_buttons(screen_width, screen_height)
-            sync_stateful_button_styles()
             radar_terrain_cache["key"] = None
         elif event.type == pygame.KEYDOWN:
             if event.key == pygame.K_c and not point_over_visible_ui(pygame.mouse.get_pos()):
@@ -14318,6 +14503,8 @@ while running:
                 sync_multiplayer_menu_status()
             if event.ui_element == settings_resolution_dropdown:
                 apply_resolution_option(event.text)
+            if event.ui_element == settings_window_mode_dropdown:
+                apply_window_mode(event.text)
             if event.ui_element == settings_sound_dropdown:
                 apply_sound_level(event.text)
             if event.ui_element == settings_simulator_dropdown:
@@ -14396,6 +14583,10 @@ while running:
                 sync_display_mode_control_visibility()
             if event.ui_element == nav_mode_button:
                 display_mode = "NAV"
+                update_nav_control_visibility()
+                sync_display_mode_control_visibility()
+            if event.ui_element == nav_close_button:
+                display_mode = "MAP"
                 update_nav_control_visibility()
                 sync_display_mode_control_visibility()
             if event.ui_element == radar_orientation_button:
@@ -15085,7 +15276,7 @@ while running:
 
                 
             
-        manager.process_events(event)
+        manager.process_events(ui_event_for_internal_canvas(event))
         
     # fill the screen with a color to wipe away anything from last frame
 
@@ -15433,25 +15624,22 @@ while running:
         internal_surface.blit(menu_surface, (0,0))
 
 
+    if in_menu:
+        draw_menu()
+
+    dt = clock.tick(60) / 1000
+    manager.update(dt)
+
+    # Draw all GUI widgets in the same logical coordinate system as the game.
+    # Scaling happens only after the full frame, including nested menu widgets,
+    # has been composed.
+    manager.draw_ui(internal_surface)
+
     screen.fill((0, 0, 0))
     scaled_surface = pygame.transform.smoothscale(internal_surface, display_viewport_rect.size)
     screen.blit(scaled_surface, display_viewport_rect.topleft)
 
  #selected_sonobuoy.hz,selected_sonobuoy.db
-    
-    if in_menu:
-        draw_menu()
-
-
-
-
-    dt = clock.tick(60) / 1000
-
-
-
-    manager.update(dt)
-
-    manager.draw_ui(screen)
     if not in_menu and any(slot.display_mode == "AZIGRAM" for slot in spectrogram_slot_array):
         key_center = (
             display_viewport_rect.x + int(900 * display_scale),

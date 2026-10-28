@@ -1,6 +1,7 @@
 
 import os
 import sys
+import html
 
 DEDICATED_HOST_MODE = any(arg.lower() in ("--dedicated-host", "--host-server", "--server") for arg in sys.argv[1:])
 if DEDICATED_HOST_MODE:
@@ -63,22 +64,27 @@ hdg = 120
 # pygame apps can otherwise disappear with very little context. Keep a simple
 # append-only crash log so runtime exceptions can be inspected after exit.
 LOG_FILE = "crash.log"
+CRASH_RECOVERY_FILE = "crash_recovery.json"
+CRASH_RECOVERY_INTERVAL_SECONDS = 10.0
 COASTLINE_FILE = os.path.join("assets", "coastline.geojson")
 LAND_FILE = os.path.join("assets", "land.geojson")
 GAIST_MODEL_FILE = "gaist_models.json"
 GAIST_BOATS_DIR = os.path.join("gaist-ultra-V7_1", "SimObjects", "Boats")
 MODEL_LIBRARY_AUTO = "Auto"
 MODEL_LIBRARY_MILTECH = "Miltech Mission Hub"
+MODEL_LIBRARY_GAIST = "GAIST Ultra"
 MODEL_LIBRARY_SEAFRONT = "Seafront Sightseeing"
 MODEL_LIBRARY_ALL = "All Libraries"
 MODEL_LIBRARY_OPTIONS = [
     MODEL_LIBRARY_AUTO,
     MODEL_LIBRARY_MILTECH,
+    MODEL_LIBRARY_GAIST,
     MODEL_LIBRARY_SEAFRONT,
     MODEL_LIBRARY_ALL
 ]
 MODEL_LIBRARY_DIRS = {
-    MODEL_LIBRARY_MILTECH: ["Boats", GAIST_BOATS_DIR],
+    MODEL_LIBRARY_MILTECH: ["Boats"],
+    MODEL_LIBRARY_GAIST: [GAIST_BOATS_DIR],
     MODEL_LIBRARY_SEAFRONT: [
         "seafront-sightseeing-vessels-uksw",
         "seafront-sightseeing-vessels-uk-southeast-v2-6-0",
@@ -238,6 +244,12 @@ if not os.path.exists(LOG_FILE):
         f.write("=== Crash Log Initialized ===\n")
 
 def log_crash(exc_type, exc_value, exc_traceback):
+    recovery_writer = globals().get("write_crash_recovery_snapshot")
+    if recovery_writer is not None:
+        try:
+            recovery_writer("unhandled exception")
+        except Exception:
+            pass
     # Skip Ctrl+C interruptions
     if issubclass(exc_type, KeyboardInterrupt):
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
@@ -297,7 +309,7 @@ def discovered_model_titles_for_library(library):
         library = MODEL_LIBRARY_MILTECH
     if library == MODEL_LIBRARY_ALL:
         titles = []
-        for option in (MODEL_LIBRARY_MILTECH, MODEL_LIBRARY_SEAFRONT):
+        for option in (MODEL_LIBRARY_MILTECH, MODEL_LIBRARY_GAIST, MODEL_LIBRARY_SEAFRONT):
             for title in discovered_model_titles_for_library(option):
                 if title not in titles:
                     titles.append(title)
@@ -395,6 +407,7 @@ def all_configured_model_titles():
             titles.extend(value.values())
     titles.extend(discover_gaist_civilian_model_titles())
     titles.extend(discovered_model_titles_for_library(MODEL_LIBRARY_MILTECH))
+    titles.extend(discovered_model_titles_for_library(MODEL_LIBRARY_GAIST))
     cleaned = []
     for title in titles:
         title = str(title or "").strip()
@@ -414,7 +427,7 @@ def model_titles_for_library(model_library):
                 titles.append(title)
         return sorted(titles)
     if model_library == MODEL_LIBRARY_MILTECH:
-        return all_configured_model_titles()
+        return discovered_model_titles_for_library(MODEL_LIBRARY_MILTECH)
     return discovered_model_titles_for_library(model_library)
 
 
@@ -1774,6 +1787,11 @@ def scaled_sys_font(size, bold=False):
     return pygame.font.SysFont("mono", scaled_font_size(size), bold=bold)
 
 
+def internal_canvas_font(size, bold=False):
+    """Font for content rendered before the full 1920x1080 canvas is scaled."""
+    return pygame.font.SysFont("mono", max(1, int(size)), bold=bold)
+
+
 def apply_scaled_ui_theme():
     try:
         with open(BASE_UI_THEME_PATH, "r", encoding="utf-8") as theme_file:
@@ -1887,9 +1905,11 @@ def scroll_contact_define_container(wheel_steps, mouse_pos=None):
         return False
 
     update_contact_define_scroll_area()
-    use_vertical = bool(pygame.key.get_mods() & pygame.KMOD_SHIFT)
-    primary_bar = contact_define_container.vert_scroll_bar if use_vertical else contact_define_container.horiz_scroll_bar
-    fallback_bar = contact_define_container.horiz_scroll_bar if use_vertical else contact_define_container.vert_scroll_bar
+    # Match standard desktop behavior: the wheel scrolls vertically, while
+    # Shift+wheel moves through additional contact columns horizontally.
+    use_horizontal = bool(pygame.key.get_mods() & pygame.KMOD_SHIFT)
+    primary_bar = contact_define_container.horiz_scroll_bar if use_horizontal else contact_define_container.vert_scroll_bar
+    fallback_bar = contact_define_container.vert_scroll_bar if use_horizontal else contact_define_container.horiz_scroll_bar
     scroll_bar = primary_bar if getattr(primary_bar, "is_enabled", False) else fallback_bar
     if not getattr(scroll_bar, "is_enabled", False):
         return True
@@ -1945,6 +1965,422 @@ def make_contact_row_dropdown(options, selected, position, container):
         container=container,
         expansion_height_limit=220
     ))
+
+
+MODEL_BROWSER_PAGE_SIZE = 16
+model_browser_target_row = None
+model_browser_matches = []
+model_browser_selection_index = 0
+
+# A single browser is shared by every contact card. Unlike UIDropDownMenu it
+# only creates the visible search results, so a large GAIST install remains
+# responsive.
+model_browser_panel = pygame_gui.elements.UIPanel(
+    relative_rect=pygame.Rect((710, 155), (500, 660)),
+    manager=manager
+)
+model_browser_title = pygame_gui.elements.UITextBox(
+    html_text="<b>MODEL BROWSER</b>",
+    relative_rect=pygame.Rect((16, 12), (330, 30)),
+    manager=manager,
+    container=model_browser_panel
+)
+model_browser_close_button = pygame_gui.elements.UIButton(
+    relative_rect=pygame.Rect((390, 10), (94, 34)),
+    text="CLOSE",
+    manager=manager,
+    container=model_browser_panel
+)
+model_browser_search = pygame_gui.elements.UITextEntryLine(
+    relative_rect=pygame.Rect((16, 56), (468, 32)),
+    manager=manager,
+    container=model_browser_panel
+)
+model_browser_results = pygame_gui.elements.UIScrollingContainer(
+    relative_rect=pygame.Rect((16, 130), (468, 442)),
+    manager=manager,
+    container=model_browser_panel
+)
+model_browser_result_text = pygame_gui.elements.UITextBox(
+    html_text="",
+    relative_rect=pygame.Rect((0, 0), (448, 430)),
+    manager=manager,
+    container=model_browser_results
+)
+model_browser_previous_button = pygame_gui.elements.UIButton(
+    relative_rect=pygame.Rect((16, 588), (110, 36)),
+    text="PREVIOUS",
+    manager=manager,
+    container=model_browser_panel
+)
+model_browser_next_button = pygame_gui.elements.UIButton(
+    relative_rect=pygame.Rect((136, 588), (110, 36)),
+    text="NEXT",
+    manager=manager,
+    container=model_browser_panel
+)
+model_browser_select_button = pygame_gui.elements.UIButton(
+    relative_rect=pygame.Rect((356, 588), (128, 36)),
+    text="SELECT",
+    manager=manager,
+    container=model_browser_panel
+)
+model_browser_status = pygame_gui.elements.UITextBox(
+    html_text="Select a model",
+    relative_rect=pygame.Rect((16, 94), (468, 28)),
+    manager=manager,
+    container=model_browser_panel
+)
+model_browser_panel.hide()
+
+
+def close_model_browser():
+    global model_browser_target_row
+    model_browser_target_row = None
+    model_browser_panel.hide()
+
+
+def refresh_model_browser_results(reset_selection=True):
+    """Render a lightweight page of results instead of rebuilding many buttons."""
+    global model_browser_matches, model_browser_selection_index
+    row = model_browser_target_row
+    if row is None:
+        model_browser_status.set_text("No contact selected")
+        model_browser_result_text.set_text("")
+        return
+
+    query = model_browser_search.get_text().strip().casefold()
+    options = model_options_for_contact(
+        row.internal_type_entered, row.internal_class_entered, row.selected_model_library
+    )
+    model_browser_matches = [title for title in options if not query or query in title.casefold()]
+    if reset_selection:
+        model_browser_selection_index = 0
+    elif model_browser_matches:
+        model_browser_selection_index = max(0, min(model_browser_selection_index, len(model_browser_matches) - 1))
+    else:
+        model_browser_selection_index = 0
+
+    page_start = (model_browser_selection_index // MODEL_BROWSER_PAGE_SIZE) * MODEL_BROWSER_PAGE_SIZE
+    visible = model_browser_matches[page_start:page_start + MODEL_BROWSER_PAGE_SIZE]
+    library_name = row.selected_model_library
+    model_browser_status.set_text(
+        f"{library_name}: {len(model_browser_matches)} match(es)  |  ↑/↓ select, Enter confirm"
+    )
+    lines = []
+    for index, title in enumerate(visible, start=page_start):
+        marker = "▶" if index == model_browser_selection_index else "&nbsp;&nbsp;"
+        escaped_title = html.escape(title)
+        if index == model_browser_selection_index:
+            lines.append(f'<font color="#99C979">{marker} {escaped_title}</font>')
+        else:
+            lines.append(f"{marker} {escaped_title}")
+    model_browser_result_text.set_text("<br>".join(lines) if lines else "No matching models")
+    model_browser_previous_button.disable() if page_start == 0 else model_browser_previous_button.enable()
+    model_browser_next_button.disable() if page_start + MODEL_BROWSER_PAGE_SIZE >= len(model_browser_matches) else model_browser_next_button.enable()
+    model_browser_select_button.disable() if not model_browser_matches else model_browser_select_button.enable()
+
+
+def select_model_browser_result():
+    if model_browser_target_row is not None and model_browser_matches:
+        model_browser_target_row.set_model(model_browser_matches[model_browser_selection_index])
+    close_model_browser()
+
+
+def open_model_browser(row):
+    global model_browser_target_row
+    model_browser_target_row = row
+    model_browser_search.set_text("")
+    model_browser_title.set_text(f"<b>MODEL BROWSER — {row.selected_model_library}</b>")
+    for layer_offset, element in enumerate((
+        model_browser_panel, model_browser_title, model_browser_close_button,
+        model_browser_search, model_browser_status, model_browser_results,
+        model_browser_result_text, model_browser_previous_button,
+        model_browser_next_button, model_browser_select_button
+    )):
+        element.change_layer(1000 + layer_offset)
+    model_browser_panel.show()
+    refresh_model_browser_results()
+    focus = getattr(model_browser_search, "focus", None)
+    if focus is not None:
+        focus()
+
+
+# Native pygame model browser -------------------------------------------------
+# pygame_gui is still used for the rest of the menu, but rendering a large,
+# frequently filtered asset list through it causes expensive widget rebuilds.
+# This overlay draws only the current page and handles its own input.
+MODEL_BROWSER_RECT = pygame.Rect((540, 130), (840, 760))
+MODEL_BROWSER_RESULT_ROWS = 16
+model_browser_visible = False
+model_browser_query = ""
+model_browser_library = MODEL_LIBRARY_AUTO
+model_browser_group = "All"
+model_browser_category = "All"
+model_browser_page = 0
+model_browser_hit_rects = []
+model_browser_library_rects = []
+model_browser_group_rects = []
+model_browser_category_rects = []
+model_browser_close_rect = pygame.Rect((0, 0), (0, 0))
+model_browser_previous_rect = pygame.Rect((0, 0), (0, 0))
+model_browser_next_rect = pygame.Rect((0, 0), (0, 0))
+model_browser_font_cache = {}
+model_browser_text_cache = {}
+model_browser_title_category_cache = {}
+
+
+def model_browser_font(size, bold=False):
+    key = (size, bold)
+    if key not in model_browser_font_cache:
+        model_browser_font_cache[key] = internal_canvas_font(size, bold=bold)
+    return model_browser_font_cache[key]
+
+
+def model_browser_text(text, size, colour, bold=False):
+    key = (text, size, colour, bold)
+    if key not in model_browser_text_cache:
+        model_browser_text_cache[key] = model_browser_font(size, bold).render(text, True, colour)
+    return model_browser_text_cache[key]
+
+
+def model_browser_title_category(title):
+    """Classify asset titles for quick browsing when add-ons provide no metadata."""
+    if title in model_browser_title_category_cache:
+        return model_browser_title_category_cache[title]
+    value = title.casefold()
+    military_terms = ("carrier", "destroyer", "frigate", "corvette", "navy", "naval", "warship", "patrol", "uscg", "coastguard", "coast guard", "submarine", "lhd", "lpd", "amphib", "hms", "uss", "fns", "rfa")
+    if any(term in value for term in military_terms):
+        if any(term in value for term in ("carrier", "lhd", "lpd", "amphib")):
+            result = ("Military", "Carrier & Amphibious")
+        elif any(term in value for term in ("destroyer", "frigate")):
+            result = ("Military", "Destroyer & Frigate")
+        elif "corvette" in value or "patrol" in value or "coast" in value:
+            result = ("Military", "Corvette & Patrol")
+        else:
+            result = ("Military", "Submarines & Other")
+    elif any(term in value for term in ("fish", "trawl", "trawler")):
+        result = ("Civilian", "Fishing & Trawlers")
+    elif any(term in value for term in ("tanker", "cargo", "container", "freight", "bulk", "merchant")):
+        result = ("Civilian", "Cargo & Tankers")
+    elif any(term in value for term in ("cruise", "ferry", "passenger", "yacht", "sail")):
+        result = ("Civilian", "Passenger & Leisure")
+    else:
+        result = ("Civilian", "Workboats & Other")
+    model_browser_title_category_cache[title] = result
+    return result
+
+
+def model_browser_categories_for_group(group):
+    if group == "Military":
+        return ["All", "Carrier & Amphibious", "Destroyer & Frigate", "Corvette & Patrol", "Submarines & Other"]
+    if group == "Civilian":
+        return ["All", "Fishing & Trawlers", "Cargo & Tankers", "Passenger & Leisure", "Workboats & Other"]
+    return ["All"]
+
+
+def refresh_native_model_browser(reset_page=True):
+    global model_browser_matches, model_browser_page
+    if model_browser_target_row is None:
+        model_browser_matches = []
+        return
+    options = model_options_for_contact(
+        model_browser_target_row.internal_type_entered,
+        model_browser_target_row.internal_class_entered,
+        model_browser_library
+    )
+    query = model_browser_query.casefold()
+    model_browser_matches = []
+    for title in options:
+        group, category = model_browser_title_category(title)
+        if model_browser_group != "All" and group != model_browser_group:
+            continue
+        if model_browser_category != "All" and category != model_browser_category:
+            continue
+        if query not in title.casefold():
+            continue
+        model_browser_matches.append(title)
+    max_page = max(0, (len(model_browser_matches) - 1) // MODEL_BROWSER_RESULT_ROWS)
+    model_browser_page = 0 if reset_page else max(0, min(model_browser_page, max_page))
+
+
+def close_model_browser():
+    global model_browser_target_row, model_browser_visible
+    model_browser_target_row = None
+    model_browser_visible = False
+    model_browser_panel.hide()
+
+
+def open_model_browser(row):
+    global model_browser_target_row, model_browser_visible, model_browser_query
+    global model_browser_library, model_browser_group, model_browser_category
+    model_browser_target_row = row
+    model_browser_library = row.selected_model_library
+    model_browser_query = ""
+    model_browser_group = "All"
+    model_browser_category = "All"
+    model_browser_panel.hide()
+    model_browser_visible = True
+    refresh_native_model_browser()
+
+
+def select_native_model_browser_result(title):
+    if model_browser_target_row is not None:
+        model_browser_target_row.set_model_library(model_browser_library, title)
+    close_model_browser()
+
+
+def draw_model_browser_overlay(surface):
+    """Draw the responsive, native pygame asset browser on the internal canvas."""
+    global model_browser_hit_rects, model_browser_library_rects
+    global model_browser_group_rects, model_browser_category_rects
+    global model_browser_close_rect, model_browser_previous_rect, model_browser_next_rect
+    if not model_browser_visible:
+        return
+
+    panel = MODEL_BROWSER_RECT
+    pygame.draw.rect(surface, (5, 5, 10), panel)
+    pygame.draw.rect(surface, (20, 20, 40), panel, 1)
+    surface.blit(model_browser_text("SELECT MODEL", 22, (236, 239, 244), bold=True), (panel.x + 20, panel.y + 16))
+
+    model_browser_close_rect = pygame.Rect((panel.right - 108, panel.y + 12), (88, 34))
+    pygame.draw.rect(surface, (10, 10, 20), model_browser_close_rect)
+    pygame.draw.rect(surface, (20, 20, 40), model_browser_close_rect, 1)
+    surface.blit(model_browser_text("CLOSE", 14, (245, 245, 245)), (model_browser_close_rect.x + 19, model_browser_close_rect.y + 9))
+
+    # Library filter lives inside the browser, so users can switch sources
+    # without returning to the contact card.
+    model_browser_library_rects = []
+    library_y = panel.y + 64
+    library_width = 154
+    for index, library in enumerate(MODEL_LIBRARY_OPTIONS):
+        rect = pygame.Rect((panel.x + 20 + index * (library_width + 7), library_y), (library_width, 30))
+        model_browser_library_rects.append((rect, library))
+        selected = library == model_browser_library
+        pygame.draw.rect(surface, (20, 20, 40) if selected else (10, 10, 20), rect)
+        pygame.draw.rect(surface, (136, 192, 208) if selected else (20, 20, 40), rect, 1)
+        label = library if len(library) <= 19 else f"{library[:16]}..."
+        surface.blit(model_browser_text(label, 14, (255, 255, 255) if selected else (236, 239, 244)), (rect.x + 7, rect.y + 7))
+
+    model_browser_group_rects = []
+    group_y = panel.y + 101
+    for index, group in enumerate(("All", "Civilian", "Military")):
+        rect = pygame.Rect((panel.x + 20 + index * 132, group_y), (124, 28))
+        model_browser_group_rects.append((rect, group))
+        selected = group == model_browser_group
+        pygame.draw.rect(surface, (20, 20, 40) if selected else (10, 10, 20), rect)
+        pygame.draw.rect(surface, (136, 192, 208) if selected else (20, 20, 40), rect, 1)
+        surface.blit(model_browser_text(group.upper(), 14, (235, 240, 246)), (rect.x + 9, rect.y + 6))
+
+    model_browser_category_rects = []
+    category_y = panel.y + 135
+    categories = model_browser_categories_for_group(model_browser_group)
+    category_width = max(120, (panel.width - 40 - (len(categories) - 1) * 6) // len(categories))
+    for index, category in enumerate(categories):
+        rect = pygame.Rect((panel.x + 20 + index * (category_width + 6), category_y), (category_width, 27))
+        model_browser_category_rects.append((rect, category))
+        selected = category == model_browser_category
+        pygame.draw.rect(surface, (20, 20, 40) if selected else (10, 10, 20), rect)
+        pygame.draw.rect(surface, (136, 192, 208) if selected else (20, 20, 40), rect, 1)
+        label = category if len(category) <= 22 else f"{category[:19]}..."
+        surface.blit(model_browser_text(label, 13, (225, 230, 238)), (rect.x + 7, rect.y + 6))
+
+    search_rect = pygame.Rect((panel.x + 20, panel.y + 170), (panel.width - 40, 36))
+    pygame.draw.rect(surface, (10, 10, 20), search_rect)
+    pygame.draw.rect(surface, (20, 20, 40), search_rect, 1)
+    search_label = model_browser_query or "Type to filter models..."
+    search_colour = (240, 240, 245) if model_browser_query else (135, 145, 160)
+    surface.blit(model_browser_text(search_label, 16, search_colour), (search_rect.x + 10, search_rect.y + 8))
+
+    result_start_y = panel.y + 222
+    page_start = model_browser_page * MODEL_BROWSER_RESULT_ROWS
+    visible = model_browser_matches[page_start:page_start + MODEL_BROWSER_RESULT_ROWS]
+    model_browser_hit_rects = []
+    for index, title in enumerate(visible):
+        rect = pygame.Rect((panel.x + 20, result_start_y + index * 28), (panel.width - 40, 25))
+        model_browser_hit_rects.append((rect, title))
+        pygame.draw.rect(surface, (10, 10, 20), rect)
+        pygame.draw.rect(surface, (20, 20, 40), rect, 1)
+        surface.blit(model_browser_text(title, 14, (225, 230, 238)), (rect.x + 9, rect.y + 5))
+
+    if not visible:
+        surface.blit(model_browser_text("No matching models", 16, (200, 145, 145)), (panel.x + 22, result_start_y + 8))
+
+    page_count = max(1, math.ceil(len(model_browser_matches) / MODEL_BROWSER_RESULT_ROWS))
+    footer_y = panel.bottom - 52
+    model_browser_previous_rect = pygame.Rect((panel.x + 20, footer_y), (110, 32))
+    model_browser_next_rect = pygame.Rect((panel.x + 150, footer_y), (110, 32))
+    for rect, label, enabled in (
+        (model_browser_previous_rect, "PREVIOUS", model_browser_page > 0),
+        (model_browser_next_rect, "NEXT", model_browser_page + 1 < page_count)
+    ):
+        pygame.draw.rect(surface, (20, 20, 40) if enabled else (10, 10, 20), rect)
+        colour = (240, 240, 245) if enabled else (110, 115, 125)
+        surface.blit(model_browser_text(label, 14, colour), (rect.x + 13, rect.y + 8))
+    summary = f"{len(model_browser_matches)} results  •  Page {model_browser_page + 1}/{page_count}"
+    surface.blit(model_browser_text(summary, 14, (160, 175, 195)), (panel.right - 255, footer_y + 9))
+
+
+def handle_native_model_browser_event(event):
+    """Consume input while the native model browser is open."""
+    global model_browser_query, model_browser_library, model_browser_page
+    global model_browser_group, model_browser_category
+    if not model_browser_visible:
+        return False
+    if event.type == pygame.KEYDOWN:
+        if event.key == pygame.K_ESCAPE:
+            close_model_browser()
+        elif event.key == pygame.K_BACKSPACE:
+            model_browser_query = model_browser_query[:-1]
+            refresh_native_model_browser()
+        elif event.key == pygame.K_PAGEDOWN:
+            model_browser_page += 1
+            refresh_native_model_browser(reset_page=False)
+        elif event.key == pygame.K_PAGEUP:
+            model_browser_page -= 1
+            refresh_native_model_browser(reset_page=False)
+        elif event.unicode and event.unicode.isprintable():
+            model_browser_query += event.unicode
+            refresh_native_model_browser()
+        return True
+    if event.type == pygame.MOUSEWHEEL:
+        if MODEL_BROWSER_RECT.collidepoint(internal_mouse_pos(pygame.mouse.get_pos())):
+            model_browser_page -= event.y
+            refresh_native_model_browser(reset_page=False)
+            return True
+    if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+        position = internal_mouse_pos(event.pos)
+        if model_browser_close_rect.collidepoint(position):
+            close_model_browser()
+        elif model_browser_previous_rect.collidepoint(position):
+            model_browser_page -= 1
+            refresh_native_model_browser(reset_page=False)
+        elif model_browser_next_rect.collidepoint(position):
+            model_browser_page += 1
+            refresh_native_model_browser(reset_page=False)
+        else:
+            for rect, library in model_browser_library_rects:
+                if rect.collidepoint(position):
+                    model_browser_library = library
+                    refresh_native_model_browser()
+                    return True
+            for rect, group in model_browser_group_rects:
+                if rect.collidepoint(position):
+                    model_browser_group = group
+                    model_browser_category = "All"
+                    refresh_native_model_browser()
+                    return True
+            for rect, category in model_browser_category_rects:
+                if rect.collidepoint(position):
+                    model_browser_category = category
+                    refresh_native_model_browser()
+                    return True
+            for rect, title in model_browser_hit_rects:
+                if rect.collidepoint(position):
+                    select_native_model_browser_result(title)
+                    return True
+        return True
+    return True
 
 
 class ContactDefineRow:
@@ -2127,12 +2563,11 @@ class ContactDefineRow:
             manager=manager,
             container=self.row_panel
         )
-        self.model_dropdown_has_full_options = False
-        self.model_dropdown = make_contact_row_dropdown(
-            compact_model_options("Auto"),
-            "Auto",
-            (X2, truth_y + LABEL_H + GAP),
-            self.row_panel
+        self.model_picker_button = pygame_gui.elements.UIButton(
+            relative_rect=pygame.Rect((X2, truth_y + LABEL_H + GAP), (WIDTH, INPUT_H)),
+            text="SELECT MODEL",
+            manager=manager,
+            container=self.row_panel
         )
 
         truth_y += LABEL_H + GAP + INPUT_H + SECTION_GAP
@@ -2248,44 +2683,28 @@ class ContactDefineRow:
 
     def refresh_model_dropdown(self, selected_model=None, full_options=True):
         selected_model = selected_model if selected_model is not None else self.selected_model
-        if full_options:
-            options = model_options_for_contact(
-                self.internal_type_entered,
-                self.internal_class_entered,
-                self.selected_model_library
-            )
-            if selected_model not in options:
-                selected_model = "Auto"
-        else:
-            options = compact_model_options(selected_model)
-        self.selected_model = selected_model
-        self.model_dropdown_has_full_options = bool(full_options)
-        self.model_label.set_text('<font color="#99C979">Model</font>' if selected_model != "Auto" else "Model")
-        self.model_dropdown.kill()
-        self.model_dropdown = make_contact_row_dropdown(
-            options,
-            selected_model,
-            (220, 271),
-            self.row_panel
-        )
-
-
-    def ensure_full_model_dropdown(self):
-        if getattr(self, "model_dropdown_has_full_options", False):
-            return
-        selected_model = self.selected_model
         options = model_options_for_contact(
             self.internal_type_entered,
             self.internal_class_entered,
             self.selected_model_library
         )
         if selected_model not in options:
-            options.append(selected_model)
-        existing = set(compact_model_options(selected_model))
-        additional_options = [option for option in options if option not in existing]
-        if additional_options:
-            self.model_dropdown.add_options(additional_options)
-        self.model_dropdown_has_full_options = True
+            selected_model = "Auto"
+        self.selected_model = selected_model
+        if selected_model == "Auto":
+            self.model_label.set_text("Model")
+        else:
+            display_name = selected_model if len(selected_model) <= 24 else f"{selected_model[:21]}..."
+            self.model_label.set_text(
+                f'Model<br><font color="#99C979">{html.escape(display_name)}</font>'
+            )
+        self.model_picker_button.set_text("SELECT MODEL")
+
+
+    def ensure_full_model_dropdown(self):
+        # Retained for compatibility with existing callers. The model browser
+        # performs filtering instead of building a huge dropdown menu.
+        return
 
 
     def set_model(self, model_title):
@@ -2440,6 +2859,12 @@ whale_traffic_button = pygame_gui.elements.UIButton(
     text="ADD WHALES",
     manager=manager
 )
+crash_recovery_button = pygame_gui.elements.UIButton(
+    relative_rect=pygame.Rect((850, 665), (220, 30)),
+    text="RECOVER CRASH",
+    manager=manager,
+    tool_tip_text="Restore the most recent automatic crash-recovery snapshot."
+)
 civilian_lat_label = pygame_gui.elements.UILabel(
     relative_rect=pygame.Rect((480, 668), (58, 24)),
     text="CIV LAT",
@@ -2522,6 +2947,7 @@ register_ui_element(simulator_button, simulator_button.relative_rect)
 register_ui_element(start_button, start_button.relative_rect)
 register_ui_element(civilian_traffic_button, civilian_traffic_button.relative_rect)
 register_ui_element(whale_traffic_button, whale_traffic_button.relative_rect)
+register_ui_element(crash_recovery_button, crash_recovery_button.relative_rect)
 register_ui_element(civilian_lat_label, civilian_lat_label.relative_rect)
 register_ui_element(civilian_lat_entry, civilian_lat_entry.relative_rect)
 register_ui_element(civilian_lon_label, civilian_lon_label.relative_rect)
@@ -3446,6 +3872,13 @@ def draw_menu():
         update_contact_define_scroll_area()
 
 
+def refresh_crash_recovery_button():
+    if os.path.isfile(CRASH_RECOVERY_FILE):
+        crash_recovery_button.enable()
+    else:
+        crash_recovery_button.disable()
+
+
 def draw_start_loading_progress(progress, status_text="Loading simulation"):
     pygame.event.pump()
     progress = max(0.0, min(1.0, float(progress or 0.0)))
@@ -3488,6 +3921,8 @@ def set_menu_visible(visible):
         simulator_button.show()
         civilian_traffic_button.show()
         whale_traffic_button.show()
+        refresh_crash_recovery_button()
+        crash_recovery_button.show()
         civilian_lat_label.show()
         civilian_lat_entry.show()
         civilian_lon_label.show()
@@ -3536,6 +3971,7 @@ def set_menu_visible(visible):
         if "contact_country_dropdown" in globals():
             contact_country_dropdown.hide()
     else:
+        close_model_browser()
         contact_panel.hide()
         contact_define_container.hide()
         start_button.hide()
@@ -3544,6 +3980,7 @@ def set_menu_visible(visible):
         simulator_button.hide()
         civilian_traffic_button.hide()
         whale_traffic_button.hide()
+        crash_recovery_button.hide()
         civilian_lat_label.hide()
         civilian_lat_entry.hide()
         civilian_lon_label.hide()
@@ -4453,7 +4890,7 @@ sono_channel = '1'
 displayed_channel = 1
 auto_buoy_enabled = False
 auto_buoy_pending_drops = []
-auto_buoy_trigger_nm = 0.5
+auto_buoy_trigger_nm = 2.0
 auto_buoy_last_drop_time = 0.0
 auto_buoy_min_drop_interval = 0.8
 
@@ -6171,6 +6608,18 @@ def internal_mouse_pos(screen_pos):
     return pygame.Vector2(x, y)
 
 
+def update_ui_manager_mouse_position():
+    """Keep pygame_gui hover/scroll hit testing in internal-canvas space."""
+    position = internal_mouse_pos(pygame.mouse.get_pos())
+    manager.mouse_position = (round(position.x), round(position.y))
+
+
+# pygame_gui normally overwrites mouse_position from the physical window on
+# every update. Our UI is rendered on the 1920x1080 internal canvas, so use
+# the translated cursor position instead.
+manager._update_mouse_position = update_ui_manager_mouse_position
+
+
 def ui_event_for_internal_canvas(event):
     """Map pointer event coordinates to pygame_gui's 1920x1080 canvas."""
     if not hasattr(event, "pos"):
@@ -6612,6 +7061,17 @@ def pixels_per_nm_at(pos):
     return 1 / nm_per_pixel
 
 
+def pixels_per_nm_axes_at(pos):
+    """Return local east-west and north-south map scales in pixels per NM."""
+    pos = pygame.Vector2(pos)
+    east_nm_per_pixel = world_distance_nm(pos, pygame.Vector2(pos.x + 1, pos.y))
+    north_nm_per_pixel = world_distance_nm(pos, pygame.Vector2(pos.x, pos.y + 1))
+    return (
+        1 / east_nm_per_pixel if east_nm_per_pixel > 0 else 1.0,
+        1 / north_nm_per_pixel if north_nm_per_pixel > 0 else 1.0,
+    )
+
+
 def draw_dotted_line(surface, colour, start, end, width=1, dash_length=8, gap_length=6):
     start = pygame.Vector2(start)
     end = pygame.Vector2(end)
@@ -6646,6 +7106,21 @@ def draw_dotted_circle(surface, colour, center, radius, width=1, dash_degrees=7,
             center.x + math.sin(end_angle) * radius,
             center.y - math.cos(end_angle) * radius
         )
+        pygame.draw.line(surface, colour, start, end, width)
+        angle += dash_degrees + gap_degrees
+
+
+def draw_dotted_ellipse(surface, colour, center, radius_x, radius_y, width=1, dash_degrees=7, gap_degrees=5):
+    """Draw a dotted ellipse for a geographic circle on an equirectangular map."""
+    if radius_x <= 0 or radius_y <= 0:
+        return
+    center = pygame.Vector2(center)
+    angle = 0
+    while angle < 360:
+        start_angle = math.radians(angle)
+        end_angle = math.radians(min(angle + dash_degrees, 360))
+        start = (center.x + math.sin(start_angle) * radius_x, center.y - math.cos(start_angle) * radius_y)
+        end = (center.x + math.sin(end_angle) * radius_x, center.y - math.cos(end_angle) * radius_y)
         pygame.draw.line(surface, colour, start, end, width)
         angle += dash_degrees + gap_degrees
 
@@ -7764,8 +8239,8 @@ class SpectrogramSlot:
     def draw_xbt_profile_panel(self, xbt_profile, slot_rect):
         data_Surface.fill((5, 5, 10), rect=slot_rect)
         pygame.draw.rect(data_Surface, (92, 96, 98), slot_rect, 1)
-        title_font = scaled_sys_font(14, bold=True)
-        small_font = scaled_sys_font(11)
+        title_font = internal_canvas_font(16, bold=True)
+        small_font = internal_canvas_font(13)
         title = title_font.render(f"{xbt_profile.label} SELECTED", False, (0, 220, 235))
         data_Surface.blit(title, (slot_rect.x + 12, slot_rect.y + 38))
         data_Surface.blit(small_font.render("Open the XBT tab below for full profile.", False, (220, 220, 220)), (slot_rect.x + 12, slot_rect.y + 62))
@@ -10075,8 +10550,8 @@ def draw_combined_xbt_profile(surface, xbt_profile, rect):
     speed_colour = (0, 220, 235)
     text_colour = (205, 210, 210)
     muted = (120, 128, 130)
-    title_font = scaled_sys_font(11, bold=True)
-    tick_font = scaled_sys_font(9)
+    title_font = internal_canvas_font(14, bold=True)
+    tick_font = internal_canvas_font(12)
 
     plot_rect = rect.inflate(-58, -40)
     plot_rect.left += 34
@@ -10438,8 +10913,8 @@ def draw_xbt_panel(surface):
 
     pygame.draw.rect(surface, (5, 5, 10), panel_rect)
     pygame.draw.rect(surface, (92, 96, 98), panel_rect, 1)
-    title_font = scaled_sys_font(15, bold=True)
-    small_font = scaled_sys_font(12)
+    title_font = internal_canvas_font(18, bold=True)
+    small_font = internal_canvas_font(14)
 
     profile = selected_xbt_for_panel()
     if profile is None:
@@ -11242,6 +11717,67 @@ def live_contact_to_config_entry(contact):
     return entry
 
 
+crash_recovery_last_snapshot = 0.0
+
+
+def write_crash_recovery_snapshot(reason="periodic"):
+    """Atomically save live state without altering the user's normal config."""
+    global crash_recovery_last_snapshot
+    live_contacts = [
+        live_contact_to_config_entry(contact)
+        for contact in globals().get("contacts", [])
+        if not is_dicass_ping_contact(contact)
+    ]
+    base_config = globals().get("config", {})
+    snapshot = dict(base_config) if isinstance(base_config, dict) else {}
+    snapshot.update({
+        "description": "vASW crash recovery",
+        "recovery_version": 1,
+        "saved_at": time.time(),
+        "reason": str(reason),
+        "xplane": globals().get("xplane", 1),
+        "submarines": live_contacts,
+        "runtime": {
+            "latitude": globals().get("lat"),
+            "longitude": globals().get("long"),
+            "altitude_ft": globals().get("alt"),
+            "heading": globals().get("hdg"),
+            "display_mode": globals().get("display_mode", "MAP"),
+            "sound_level": globals().get("master_sound_level", 1.0),
+            "window_mode": globals().get("settings_window_mode", "Windowed"),
+            "window_size": [globals().get("screen_width", 1920), globals().get("screen_height", 1080)],
+            "multiplayer_role": globals().get("multiplayer_role", "OFF"),
+            "multiplayer_player_type": globals().get("MULTIPLAYER_PLAYER_TYPE", "Aircraft"),
+            "multiplayer_team": globals().get("MULTIPLAYER_TEAM", "Neutral"),
+        },
+    })
+    temporary_path = f"{CRASH_RECOVERY_FILE}.tmp"
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as recovery_file:
+            json.dump(snapshot, recovery_file, indent=4)
+        os.replace(temporary_path, CRASH_RECOVERY_FILE)
+        crash_recovery_last_snapshot = time.time()
+        return True
+    except OSError as exc:
+        print(f"Crash recovery snapshot failed: {exc}")
+        return False
+
+
+def maybe_write_crash_recovery_snapshot():
+    if globals().get("in_menu", True):
+        return
+    if time.time() - crash_recovery_last_snapshot >= CRASH_RECOVERY_INTERVAL_SECONDS:
+        write_crash_recovery_snapshot("periodic")
+
+
+def clear_crash_recovery_snapshot():
+    try:
+        if os.path.isfile(CRASH_RECOVERY_FILE):
+            os.remove(CRASH_RECOVERY_FILE)
+    except OSError as exc:
+        print(f"Could not clear crash recovery snapshot: {exc}")
+
+
 def save_all_live_contacts_to_config(reason="autosave"):
     cfg_path = globals().get("config_path", "config.json")
     try:
@@ -11800,8 +12336,8 @@ def auto_drop_search_pattern_buoys():
     set_auto_buoy_enabled(not auto_buoy_enabled)
 
 
-def launch_auto_buoy_drop(drop):
-    point = pygame.Vector2(drop["point"])
+def launch_auto_buoy_drop(drop, launch_point=None):
+    point = pygame.Vector2(launch_point if launch_point is not None else drop["point"])
     launch_lat, launch_lon = pix_to_latlong(point.x, point.y)
     action = {
         "kind": "vasw_mp",
@@ -11834,13 +12370,15 @@ def update_auto_buoy_system():
         distance_nm = world_distance_nm(player_world, pygame.Vector2(drop["point"]))
         drop["distance_nm"] = distance_nm
         if distance_nm <= auto_buoy_trigger_nm:
-            if launch_auto_buoy_drop(drop):
+            if launch_auto_buoy_drop(drop, player_world):
+                drop["trigger_point"] = pygame.Vector2(drop["point"])
+                drop["point"] = player_world.copy()
                 drop["dropped"] = True
                 auto_buoy_last_drop_time = now
                 update_launch_channel_pool()
                 for slot in spectrogram_slot_array:
                     slot.update_ui()
-                print(f"AUTO BUOY dropped {drop['selection']} CH {drop['channel']} at {distance_nm:.2f} NM")
+                print(f"AUTO BUOY dropped {drop['selection']} CH {drop['channel']} at aircraft position ({distance_nm:.2f} NM from point)")
             break
     if all(drop.get("dropped") for drop in auto_buoy_pending_drops):
         auto_buoy_enabled = False
@@ -13570,6 +14108,9 @@ def draw_radar_display(surface):
     ownship_heading = -90 if radar_orientation == "TRACK" else hdg - 90
     draw_heading_line(surface, center, ownship_heading, 28, (0, 220, 255), 2)
     draw_remote_aircraft_radar(surface, player_world, center, radar_radius, pixels_per_nm, rotation_deg)
+    draw_contact_creation_range_circles_radar(
+        surface, player_world, center, radar_radius, pixels_per_nm, rotation_deg
+    )
 
     for contact in contacts:
         if not hasattr(contact, "contact_lat") or not hasattr(contact, "contact_long"):
@@ -13726,8 +14267,6 @@ def draw_visible_contacts_on_map(surface):
 
 def draw_contact_creation_range_circles(surface):
     surface_rect = surface.get_rect().inflate(160, 160)
-    circle_colour = (145, 145, 145)
-    label_colour = (180, 180, 180)
 
     for row in contact_define_row_array:
         try:
@@ -13739,18 +14278,60 @@ def draw_contact_creation_range_circles(surface):
         if range_nm <= 0:
             continue
 
+        live_contact = contact_by_name(getattr(row, "name_entered", ""))
+        team = str(getattr(live_contact, "team", getattr(row, "team_entered", "Neutral")) or "Neutral").upper()
+        if team not in CONTACT_TEAM_OPTIONS:
+            team = "Neutral"
+        circle_colour = multiplayer_team_colour(team)
+        label_colour = tuple(min(255, channel + 35) for channel in circle_colour)
+
         center_world = pygame.Vector2(latlong_to_pix(center_lat, center_lon))
         center_screen = pygame.Vector2(map_layer.translate_point(center_world))
-        radius_px = range_nm * pixels_per_nm_at(center_world) * map_layer.zoom
-        if radius_px <= 1:
+        pixels_per_nm_east, pixels_per_nm_north = pixels_per_nm_axes_at(center_world)
+        radius_x = range_nm * pixels_per_nm_east * map_layer.zoom
+        radius_y = range_nm * pixels_per_nm_north * map_layer.zoom
+        if max(radius_x, radius_y) <= 1:
             continue
-        if not surface_rect.collidepoint(center_screen):
+        if not surface_rect.colliderect(pygame.Rect(
+            center_screen.x - radius_x,
+            center_screen.y - radius_y,
+            radius_x * 2,
+            radius_y * 2,
+        )):
             continue
 
-        draw_dotted_circle(surface, circle_colour, center_screen, radius_px, 1)
+        draw_dotted_ellipse(surface, circle_colour, center_screen, radius_x, radius_y, 1)
         pygame.draw.circle(surface, circle_colour, center_screen, 3, 1)
-        label = font.render(f"{range_nm:g} NM", False, label_colour)
+        label = font.render(f"{team} {range_nm:g} NM", False, label_colour)
         surface.blit(label, (center_screen.x + 6, center_screen.y + 5))
+
+
+def draw_contact_creation_range_circles_radar(surface, player_world, center, radar_radius, pixels_per_nm, rotation_deg):
+    """Show the same team-coloured expected-contact areas on radar."""
+    for row in contact_define_row_array:
+        try:
+            center_lat = float(getattr(row, "lat_entered", None))
+            center_lon = float(getattr(row, "long_entered", None))
+            range_nm = float(getattr(row, "range_entered", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if range_nm <= 0:
+            continue
+
+        live_contact = contact_by_name(getattr(row, "name_entered", ""))
+        team = str(getattr(live_contact, "team", getattr(row, "team_entered", "Neutral")) or "Neutral").upper()
+        if team not in CONTACT_TEAM_OPTIONS:
+            team = "Neutral"
+        circle_colour = multiplayer_team_colour(team)
+        center_world = pygame.Vector2(latlong_to_pix(center_lat, center_lon))
+        center_screen = radar_point_from_world(center_world, player_world, center, pixels_per_nm, rotation_deg)
+        radius_px = range_nm * pixels_per_nm
+        if center.distance_to(center_screen) > radar_radius + radius_px:
+            continue
+        draw_circle_inside_radar(surface, circle_colour, center_screen, radius_px, center, radar_radius, 1)
+        if center.distance_to(center_screen) <= radar_radius:
+            label = font.render(f"{team} {range_nm:g}NM", False, circle_colour)
+            surface.blit(label, (center_screen.x + 6, center_screen.y + 5))
 
 
 class Sprite(pygame.sprite.Sprite):
@@ -13989,6 +14570,7 @@ set_menu_visible(True)
 while running:
     process_server_commands()
     maybe_server_contact_autosave()
+    maybe_write_crash_recovery_snapshot()
     if state == STATE_MENU:
         draw_menu()
 
@@ -14067,6 +14649,8 @@ while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
+        elif model_browser_visible and handle_native_model_browser_event(event):
+            continue
         elif event.type == pygame.VIDEORESIZE:
             if settings_window_mode == "Fullscreen":
                 continue
@@ -14079,6 +14663,19 @@ while running:
             update_display_viewport()
             radar_terrain_cache["key"] = None
         elif event.type == pygame.KEYDOWN:
+            if model_browser_panel.visible:
+                if event.key == pygame.K_ESCAPE:
+                    close_model_browser()
+                elif event.key == pygame.K_RETURN:
+                    select_model_browser_result()
+                elif event.key == pygame.K_DOWN and model_browser_matches:
+                    model_browser_selection_index = min(
+                        len(model_browser_matches) - 1, model_browser_selection_index + 1
+                    )
+                    refresh_model_browser_results(reset_selection=False)
+                elif event.key == pygame.K_UP and model_browser_matches:
+                    model_browser_selection_index = max(0, model_browser_selection_index - 1)
+                    refresh_model_browser_results(reset_selection=False)
             if event.key == pygame.K_c and not point_over_visible_ui(pygame.mouse.get_pos()):
                 copy_latlon_at_screen_pos(pygame.mouse.get_pos())
 
@@ -14094,11 +14691,6 @@ while running:
 
         if event.type == pygame.MOUSEBUTTONDOWN:
             handled_search_pattern_chord = False
-            if event.button == 1 and in_menu:
-                for row in contact_define_row_array:
-                    if not getattr(row, "model_dropdown_has_full_options", True) and row.model_dropdown.rect.collidepoint(event.pos):
-                        row.ensure_full_model_dropdown()
-                        break
             if event.button == 1 and not in_menu:
                 for slot in spectrogram_slot_array:
                     if slot.handle_narrowband_drag_start(event.pos):
@@ -14215,6 +14807,8 @@ while running:
                 measure_drag_current_world = current_world
 
         if event.type == pygame_gui.UI_TEXT_ENTRY_CHANGED:
+           if event.ui_element == model_browser_search and model_browser_panel.visible:
+                refresh_model_browser_results()
            for row in contact_define_row_array:
                 print(row.contact_name_textbox.get_object_ids())
                 if event.ui_element == row.contact_name_textbox:
@@ -14532,11 +15126,20 @@ while running:
                     row.set_team(dropdown_value(event.text))
                 if event.ui_element == row.model_library_dropdown:
                     row.set_model_library(dropdown_value(event.text))
-                if event.ui_element == row.model_dropdown:
-                    row.ensure_full_model_dropdown()
-                    row.set_model(dropdown_value(event.text))
 
         if event.type == pygame_gui.UI_BUTTON_PRESSED:
+            if event.ui_element == model_browser_close_button:
+                close_model_browser()
+            elif event.ui_element == model_browser_select_button:
+                select_model_browser_result()
+            elif event.ui_element == model_browser_previous_button and model_browser_matches:
+                model_browser_selection_index = max(0, model_browser_selection_index - MODEL_BROWSER_PAGE_SIZE)
+                refresh_model_browser_results(reset_selection=False)
+            elif event.ui_element == model_browser_next_button and model_browser_matches:
+                model_browser_selection_index = min(
+                    len(model_browser_matches) - 1, model_browser_selection_index + MODEL_BROWSER_PAGE_SIZE
+                )
+                refresh_model_browser_results(reset_selection=False)
             if event.ui_element == settings_button:
                 sync_settings_fields()
                 set_settings_panel_visible(not settings_panel_visible)
@@ -14555,6 +15158,8 @@ while running:
                     define_contact_from_row(duplicate_contact_pending_row, override_duplicate=True)
                 set_duplicate_contact_popup_visible(False)
             for row in list(contact_define_row_array):
+                if event.ui_element == row.model_picker_button:
+                    open_model_browser(row)
                 if event.ui_element == row.broadcasting_checkbox:
                     row.set_broadcasting(not row.broadcasting_entered)
                 if event.ui_element == row.delete_contact_button:
@@ -14737,14 +15342,32 @@ while running:
 
                 with open("config.json", "w") as f:
                     json.dump(saved_config, f, indent=4)
-            if event.ui_element == load_button:
+            if event.ui_element in (load_button, crash_recovery_button):
+                restoring_crash_recovery = event.ui_element == crash_recovery_button
 
-                base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-                config_path = os.path.join(base_path, 'config.json')
+                if restoring_crash_recovery:
+                    config_path = CRASH_RECOVERY_FILE
+                else:
+                    base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+                    config_path = os.path.join(base_path, 'config.json')
 
                 # LOAD FILE
                 with open(config_path, "r") as f:
                     config = json.load(f)
+
+                if restoring_crash_recovery:
+                    runtime = config.get("runtime", {}) if isinstance(config, dict) else {}
+                    xplane = int(config.get("xplane", xplane) or 0)
+                    lat = runtime.get("latitude", lat)
+                    long = runtime.get("longitude", long)
+                    alt = runtime.get("altitude_ft", alt)
+                    hdg = float(runtime.get("heading", hdg) or hdg)
+                    display_mode = str(runtime.get("display_mode", display_mode) or "MAP")
+                    apply_sound_level(f"{float(runtime.get('sound_level', master_sound_level) or master_sound_level) * 100:.0f}%")
+                    MULTIPLAYER_PLAYER_TYPE = str(runtime.get("multiplayer_player_type", MULTIPLAYER_PLAYER_TYPE))
+                    MULTIPLAYER_TEAM = str(runtime.get("multiplayer_team", MULTIPLAYER_TEAM))
+                    multiplayer_role = str(runtime.get("multiplayer_role", multiplayer_role))
+                    simulator_button.set_text("X-Plane" if xplane == 1 else "MSFS")
 
                 contacts.clear()  # clear old contacts
 
@@ -14890,6 +15513,15 @@ while running:
 
                 update_all_contact_shadow_following()
                 update_contact_define_scroll_area()
+                if restoring_crash_recovery:
+                    state = STATE_GAME
+                    in_menu = False
+                    set_menu_visible(False)
+                    update_nav_control_visibility()
+                    sync_display_mode_control_visibility()
+                    sync_settings_fields()
+                    write_crash_recovery_snapshot("recovered session")
+                    print(f"Recovered {len(contacts)} contacts from {CRASH_RECOVERY_FILE}")
 
             if event.ui_element == start_button:
                 duplicate_row, duplicate_name = first_duplicate_contact_row()
@@ -14936,6 +15568,7 @@ while running:
                 start_game(draw_start_loading_progress)
                 in_menu = False
                 set_menu_visible(False)
+                write_crash_recovery_snapshot("session start")
                 draw_start_loading_progress(1.0, "Ready")
 
             if event.ui_element == civilian_traffic_button:
@@ -15634,6 +16267,7 @@ while running:
     # Scaling happens only after the full frame, including nested menu widgets,
     # has been composed.
     manager.draw_ui(internal_surface)
+    draw_model_browser_overlay(internal_surface)
 
     screen.fill((0, 0, 0))
     scaled_surface = pygame.transform.smoothscale(internal_surface, display_viewport_rect.size)
@@ -15652,6 +16286,7 @@ while running:
  
 stop_listen_audio()
 close_multiplayer_socket()
+clear_crash_recovery_snapshot()
 pygame.quit()
 
 
